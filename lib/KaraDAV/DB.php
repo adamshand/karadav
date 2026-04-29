@@ -76,6 +76,10 @@ class DB extends \SQLite3
 
 	public function getPathLikeExpression(string $path)
 	{
+		if ($path === '') {
+			return '%';
+		}
+
 		return str_replace(['?', '%'], ['\\?', '\\%'], $path) . '/%';
 	}
 

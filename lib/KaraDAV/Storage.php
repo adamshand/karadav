@@ -192,6 +192,10 @@ class Storage extends AbstractStorage implements TrashInterface
 				}
 
 				if (!$mtime) {
+					$mtime = filemtime($target);
+				}
+
+				if (!$mtime) {
 					return null;
 				}
 

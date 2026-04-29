@@ -71,6 +71,13 @@ foreach ($defaults as $const => $value) {
 
 class UserException extends \RuntimeException {}
 
+if (!function_exists(__NAMESPACE__ . '\\_')) {
+	function _($id, array $args = [], $domain = null)
+	{
+		return \KD2\_($id, $args, $domain);
+	}
+}
+
 if (!ERRORS_SHOW) {
 	ErrorManager::setEnvironment(ErrorManager::PRODUCTION);
 }
@@ -98,7 +105,7 @@ define('KaraDAV\ENABLE_THUMBNAILS_OK', $th);
 if (!defined('KaraDAV\SECRET_KEY')) {
 	$cfg = file_exists($cfg_file) ? file_get_contents($cfg_file) : "<?php\nnamespace KaraDAV;\n\n";
 
-	if (false == strpos($cfg, 'SECRET_KEY')) {
+	if (!preg_match('/^\s*const\s+SECRET_KEY\s*=/m', $cfg)) {
 		$secret = base64_encode(random_bytes(16));
 
 		$c = sprintf("\n\n// Randomly generated secret key, please change only if necessary\nconst SECRET_KEY = %s;\n\n",

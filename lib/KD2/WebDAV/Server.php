@@ -773,10 +773,11 @@ class Server
 				$uri = substr($uri, strlen($this->prefix));
 			}
 
+			$relative_uri = $uri;
 			$uri = trim(rtrim($this->base_uri, '/') . '/' . ltrim($uri, '/'), '/');
 			$path = '/' . str_replace('%2F', '/', rawurlencode($uri));
 
-			if (($item['DAV::resourcetype'] ?? null) == 'collection' && $path != '/') {
+			if ((($item['DAV::resourcetype'] ?? null) == 'collection' || $relative_uri === '') && $path != '/') {
 				$path .= '/';
 			}
 

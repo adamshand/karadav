@@ -1,5 +1,5 @@
 {{Login} assign="title"}
-{include file="_header.tpl"}
+{include file="_header.tpl" current="login"}
 
 {if $error === -1}
 	<p class="info">{{You are logged in, you can close this window or tab and go back to the app.}}</p>
