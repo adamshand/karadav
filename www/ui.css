@@ -304,9 +304,7 @@ p.info tt {
 	padding: .2em;
 }
 
-.avatar,
-main table td:first-child > img,
-main h3 > img {
+.avatar {
 	width: 64px;
 	height: 64px;
 	object-fit: cover;
@@ -314,8 +312,7 @@ main h3 > img {
 	vertical-align: middle;
 }
 
-h3 img.avatar,
-main h3 > img {
+h3 img.avatar {
 	margin: 0 1em;
 }
 
