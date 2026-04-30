@@ -1,7 +1,7 @@
 {{Edit user} assign="title"}
 {include file="_header.tpl" current="users"}
 
-<form method="post" action="">
+<form method="post" action="" enctype="multipart/form-data">
 {form_csrf}
 	<?php $quota = $user->quota > 0 ? round($user->quota / 1024 / 1024) : $user->quota; ?>
 
@@ -22,6 +22,14 @@
 			<dt><label for="f_is_admin">{{Status}}</label></dt>
 			<dd><label><input type="checkbox" name="is_admin" id="f_is_admin" {if $user.is_admin}checked="checked"{/if} /> {{Admin}}</label></dd>
 	{/if}
+
+			<dt>{{Avatar}}</dt>
+			<dd><img src="{$user.avatar_url}" alt="" class="avatar" /></dd>
+			<dd><input type="file" name="avatar" id="f_avatar" accept="image/jpeg,image/png,image/gif,image/webp" /></dd>
+			{if $has_avatar}
+			<dd><label><input type="checkbox" name="delete_avatar" value="1" /> {{Remove custom avatar}}</label></dd>
+			{/if}
+			<dd>{{JPEG, PNG, GIF or WebP, up to 2 MB.}}</dd>
 
 			<dt><label for="f_quota">{{Quota}}</label></dt>
 			<dd><input type="number" name="quota" step="1" min="-1" value="{$quota}" required="required" size="6" /> {{(in MB)}}</dd>

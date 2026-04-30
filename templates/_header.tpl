@@ -4,7 +4,7 @@
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1.0, target-densitydpi=device-dpi" />
 	<title>{$title}</title>
-	<link rel="stylesheet" type="text/css" href="{$www_url}ui.css?2025" />
+	<link rel="stylesheet" type="text/css" href="{$www_url}ui.css?2026" />
 	<link rel="icon" type="image/svg+xml" href="{$www_url}logo.svg" />
 </head>
 <body>
