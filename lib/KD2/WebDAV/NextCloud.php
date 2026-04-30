@@ -466,6 +466,16 @@ abstract class NextCloud
 	{
 		$this->requireAuth();
 
+		// Some Nextcloud clients (notably the macOS File Provider extension) may
+		// request the short /dav/files/{user} endpoint, but their local metadata
+		// model expects WebDAV hrefs under the canonical /remote.php/dav/files/{user}
+		// endpoint. If we echo /dav/files/... hrefs back, virtual-file children get
+		// parented under a synthetic "user" directory instead of the File Provider
+		// root and Finder shows an empty location.
+		if (preg_match('!^dav/files/([^/]+)(/.*)?$!', $uri, $match)) {
+			$uri = 'remote.php/dav/files/' . $match[1] . ($match[2] ?? '');
+		}
+
 		// ownCloud-Android is using a different preview API
 		// remote.php/dav/files/user/name.jpg?x=224&y=224&c=&preview=1
 		if (!empty($_GET['preview'])) {
@@ -566,7 +576,11 @@ abstract class NextCloud
 		}
 
 		return [
-			'server'      => $this->root_url,
+			// The macOS File Provider extension concatenates this value with
+			// "/remote.php/dav/files/{user}" verbatim. Returning a trailing slash
+			// creates a double-slash account.davFilesUrl, which then no longer
+			// matches the single-slash WebDAV hrefs returned by the server.
+			'server'      => rtrim($this->root_url, '/'),
 			'loginName'   => $session['login'],
 			'appPassword' => $session['password'],
 		];
