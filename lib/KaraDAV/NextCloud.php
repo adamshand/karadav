@@ -35,8 +35,8 @@ class NextCloud extends WebDAV_NextCloud
 			'logo'                 => '',
 			'background'           => '#d3dddb',
 			'background-text'      => '#000000',
-			'background-plain'     => '',
-			'background-default'   => '',
+			'background-plain'     => false,
+			'background-default'   => false,
 			'logoheader'           => $this->root_url . '/logo.svg',
 			'favicon'              => $this->root_url . '/logo.svg',
 		];
@@ -226,7 +226,7 @@ class NextCloud extends WebDAV_NextCloud
 		$w = $_GET['x'] ?? null;
 		$h = $_GET['y'] ?? null;
 
-		if (!ENABLE_THUMBNAILS_OK || !$id) {
+		if (!$id) {
 			http_response_code(404);
 			return;
 		}
@@ -244,8 +244,7 @@ class NextCloud extends WebDAV_NextCloud
 
 	public function serveThumbnail(string $uri, int $width, int $height, bool $crop = false, bool $preview = false): void
 	{
-		if (!ENABLE_THUMBNAILS_OK
-			|| !preg_match('/\.(?:jpe?g|gif|png|webp)$/', $uri)) {
+		if (!preg_match('/\.(?:jpe?g|gif|png|webp)$/i', $uri)) {
 			http_response_code(404);
 			return;
 		}
@@ -255,6 +254,23 @@ class NextCloud extends WebDAV_NextCloud
 
 		if (!$this->storage->exists($uri)) {
 			throw new WebDAV_Exception('Not found', 404);
+		}
+
+		// If this PHP build lacks GD/Imagick, still return the original image
+		// instead of 404. Nextcloud iOS prefers a real image response and will
+		// cache it as a preview; this is less efficient but keeps the UI usable.
+		if (!ENABLE_THUMBNAILS_OK) {
+			$file = $this->storage->get($uri);
+			$path = $file['path'] ?? null;
+
+			if (!$path || !is_file($path)) {
+				throw new WebDAV_Exception('Not found', 404);
+			}
+
+			header('Content-Type: ' . (@mime_content_type($path) ?: 'application/octet-stream'));
+			header('Content-Length: ' . filesize($path));
+			readfile($path);
+			return;
 		}
 
 		if ($crop || $width < 300 || $height < 300) {

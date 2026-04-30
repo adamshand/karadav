@@ -184,7 +184,7 @@ class Storage extends AbstractStorage implements TrashInterface
 			case 'DAV::resourcetype':
 				return is_dir($target) ? 'collection' : '';
 			case 'DAV::getlastmodified':
-				if (!$uri && $depth == 0 && is_dir($target)) {
+				if (is_dir($target)) {
 					$mtime = $this->getRecursiveFileProperty($uri, 'modified');
 				}
 				else {
@@ -205,7 +205,7 @@ class Storage extends AbstractStorage implements TrashInterface
 			case 'DAV::ishidden':
 				return basename($target)[0] == '.';
 			case 'DAV::getetag':
-				if ($depth) {
+				if (is_dir($target)) {
 					$hash = $this->getRecursiveFileProperty($uri, 'modified')
 						. $this->getRecursiveFileProperty($uri, 'size');
 				}
@@ -239,7 +239,7 @@ class Storage extends AbstractStorage implements TrashInterface
 			case NextCloud::PROP_OC_SHARETYPES:
 				return WebDAV::EMPTY_PROP_VALUE;
 			case NextCloud::PROP_OC_DOWNLOADURL:
-				return $this->nextcloud->getDirectDownloadURL($uri, $this->users->current()->login);
+				return is_dir($target) ? null : $this->nextcloud->getDirectDownloadURL($uri, $this->users->current()->login);
 			case Nextcloud::PROP_NC_RICH_WORKSPACE:
 				if (!is_dir($target)) {
 					return '';
@@ -292,12 +292,12 @@ class Storage extends AbstractStorage implements TrashInterface
 
 				return $this->getTrashInfo(basename($uri))['Path'] ?? null;
 			case 'DAV::quota-available-bytes':
-				return null;
+				return $this->users->quota($this->users->current())->free;
 			case 'DAV::quota-used-bytes':
-				return null;
+				return $this->users->quota($this->users->current())->used;
 			case Nextcloud::PROP_OC_SIZE:
 				if (is_dir($target)) {
-					return $this->getRecursiveFileProperty($uri, 'size');
+					return $this->getRecursiveFileProperty($uri, 'size') ?? 0;
 				}
 				else {
 					return self::getFilesize($target);
@@ -310,11 +310,49 @@ class Storage extends AbstractStorage implements TrashInterface
 				break;
 		}
 
-		if (in_array($name, NextCloud::NC_PROPERTIES) || in_array($name, WebDAV::BASIC_PROPERTIES) || in_array($name, WebDAV::EXTENDED_PROPERTIES)) {
+		$stored = $this->getResourceProperties($uri)->get($name);
+
+		if (null !== $stored) {
+			return $stored;
+		}
+
+		// Nextcloud mobile clients request a large set of optional properties and
+		// can behave poorly when many are returned as 404. Provide harmless
+		// defaults for the common ownCloud/Nextcloud extension properties that
+		// KaraDAV does not persist.
+		if (str_starts_with($name, NextCloud::OC_NAMESPACE . ':')) {
+			return match (substr($name, strlen(NextCloud::OC_NAMESPACE) + 1)) {
+				'favorite', 'comments-unread' => '0',
+				'owner-id', 'owner-display-name' => $this->users->current()->login,
+				'data-fingerprint' => '',
+				'checksums', 'share-types' => WebDAV::EMPTY_PROP_VALUE,
+				default => null,
+			};
+		}
+
+		if (str_starts_with($name, NextCloud::NC_NAMESPACE . ':')) {
+			$target = $this->users->current()->path . $uri;
+
+			return match (substr($name, strlen(NextCloud::NC_NAMESPACE) + 1)) {
+				'creation_time' => (string) filectime($target),
+				'upload_time' => (string) filemtime($target),
+				'has-preview' => preg_match('!\.(?:webp|jpe?g|gif|png)$!i', $uri) ? 'true' : 'false',
+				'is-encrypted' => 'false',
+				'hidden' => basename($target)[0] == '.' ? 'true' : 'false',
+				default => null,
+			};
+		}
+
+		if ($name === 'http://open-collaboration-services.org/ns:share-permissions'
+			|| $name === 'http://open-cloud-mesh.org/ns:share-permissions') {
 			return null;
 		}
 
-		return $this->getResourceProperties($uri)->get($name);
+		if (in_array($name, WebDAV::BASIC_PROPERTIES) || in_array($name, WebDAV::EXTENDED_PROPERTIES)) {
+			return null;
+		}
+
+		return null;
 	}
 
 	public function propfind(string $uri, ?array $properties, int $depth): ?array
@@ -599,7 +637,7 @@ class Storage extends AbstractStorage implements TrashInterface
 			$st->bindValue(1, $user->id);
 			$st->bindValue(2, $path);
 			$st->bindValue(3, $f->isDir() ? 0 : self::getFileSize($f->getRealPath()));
-			$st->bindValue(4, $f->isDir() ? 0 : $f->getMTime());
+			$st->bindValue(4, $f->getMTime());
 			$st->execute();
 			$st->clear();
 			$st->reset();
@@ -651,9 +689,11 @@ class Storage extends AbstractStorage implements TrashInterface
 
 		$db->exec('BEGIN;');
 
+		$now = time();
+
 		foreach ($paths as $path) {
-			$db->run('REPLACE INTO files (user, path, size, modified) VALUES (?, ?, 0, 0);',
-				$this->users->current()->id, $path);
+			$db->run('REPLACE INTO files (user, path, size, modified) VALUES (?, ?, 0, ?);',
+				$this->users->current()->id, $path, $now);
 		}
 
 		$db->exec('COMMIT;');
@@ -727,10 +767,11 @@ class Storage extends AbstractStorage implements TrashInterface
 			$path
 		);
 
-		// root path doesn't exist in database, just assign a very large value
-		// if you have more than 1 trillion files well… you might miss one
+		// Root path doesn't exist in database. Keep its synthetic ID inside
+		// 32-bit range: some mobile clients store file IDs in SQLite/int fields
+		// and may silently drop directory listings when this is too large.
 		if (!$id && $path === '') {
-			$id = 999999999999;
+			$id = 1000000000;
 		}
 
 		return $id;

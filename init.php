@@ -203,7 +203,7 @@ if (LOG_FILE && isset($_SERVER['REMOTE_ADDR'])) {
 		implode("\n  ", array_map(fn ($v, $k) => $k . ': ' . $v, $headers, array_keys($headers)))
 	);
 
-	if ($method === 'PROPFIND' || $method === 'PROPPATCH') {
+	if (in_array($method, ['PROPFIND', 'PROPPATCH', 'REPORT'], true)) {
 		http_log("ROUTER: <= Request body:\n%s", file_get_contents('php://input'));
 	}
 }

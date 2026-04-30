@@ -377,7 +377,7 @@ class Server
 		}
 
 
-		$prop = $this->storage->propfind($uri, ['DAV::getetag'], 0);
+		$prop = $this->storage->propfind($uri, ['DAV::getetag', 'http://owncloud.org/ns:fileid'], 0);
 
 		if (!empty($prop['DAV::getetag'])) {
 			$value = $prop['DAV::getetag'];
@@ -387,6 +387,11 @@ class Server
 			}
 
 			header(sprintf('ETag: %s', $value));
+			header(sprintf('OC-ETag: %s', $value));
+		}
+
+		if (!empty($prop['http://owncloud.org/ns:fileid'])) {
+			header('OC-FileId: ' . $prop['http://owncloud.org/ns:fileid']);
 		}
 
 		http_response_code($created ? 201 : 204);
@@ -657,6 +662,28 @@ class Server
 		return $properties;
 	}
 
+	public function http_report(string $uri): ?string
+	{
+		$body = file_get_contents('php://input');
+
+		if (false !== strpos($body, '<!DOCTYPE ')) {
+			throw new Exception('Invalid XML', 400);
+		}
+
+		// Nextcloud clients use REPORT with oc:filter-files to list favorites
+		// recursively. KaraDAV does not currently track favorites, so return an
+		// empty multistatus instead of a 405, otherwise mobile clients may keep
+		// retrying the request.
+		if (false !== strpos($body, 'filter-files')) {
+			header('HTTP/1.1 207 Multi-Status', true);
+			$this->dav_header();
+			header('Content-Type: application/xml; charset=utf-8');
+			return '<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" />';
+		}
+
+		throw new Exception('Invalid request method', 405);
+	}
+
 	public function http_propfind(string $uri): ?string
 	{
 		// We only support depth of 0 and 1
@@ -724,6 +751,13 @@ class Server
 
 		$root_namespaces = [
 			'DAV:' => 'd',
+			// Keep common Nextcloud/ownCloud prefixes stable. Some mobile clients
+			// appear to parse these extension properties by prefixed name rather
+			// than by namespace URI.
+			'http://owncloud.org/ns' => 'oc',
+			'http://nextcloud.org/ns' => 'nc',
+			'http://open-collaboration-services.org/ns' => 'ocs',
+			'http://open-cloud-mesh.org/ns' => 'ocm',
 			// Microsoft Clients need this special namespace for date and time values (from PEAR/WebDAV)
 			'urn:uuid:c2f41010-65b3-11d1-a29f-00aa00c14882/' => 'ns0',
 		];
@@ -849,8 +883,11 @@ class Server
 
 			$e .= '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>' . "\n";
 
-			// Append missing properties
-			if (!empty($requested)) {
+			// Append missing properties. Nextcloud iOS is fragile here and may
+			// ignore a whole listing when optional extension properties are returned
+			// as 404 propstats, so omit missing optional props for that client.
+			$ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+			if (!empty($requested) && false === stripos($ua, 'Nextcloud-iOS')) {
 				$missing_properties = array_diff($requested_keys, array_keys($item));
 
 				if (count($missing_properties)) {
