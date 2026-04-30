@@ -25,10 +25,18 @@ form_exec_if('save', function () use ($ldap, $user, $logged_user, $users) {
 
 	$users->edit($user->id, $data);
 
+	if (!empty($_POST['delete_avatar'])) {
+		$users->deleteAvatar($user);
+	}
+
+	$users->saveAvatarFromUpload($user, $_FILES['avatar'] ?? null);
+
 	if ($user->id === $logged_user->id) {
 		$_SESSION['user'] = $users->getById($logged_user->id);
 	}
 }, 'users/');
 
-$tpl->assign(compact('user'));
+$has_avatar = (bool) $users->avatarPath($user);
+
+$tpl->assign(compact('user', 'has_avatar'));
 $tpl->display('users/edit.tpl');

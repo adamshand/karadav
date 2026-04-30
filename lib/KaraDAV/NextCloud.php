@@ -211,8 +211,27 @@ class NextCloud extends WebDAV_NextCloud
 		return ['created' => !$exists, 'etag' => md5(filemtime($target) . filesize($target))];
 	}
 
-	protected function nc_avatar(): void
+	protected function nc_avatar(?string $uri = null): void
 	{
+		$token = null;
+		$parts = explode('/', trim($uri ?? '', '/'));
+
+		foreach (['avatars', 'avatar'] as $segment) {
+			$index = array_search($segment, $parts, true);
+
+			if ($index !== false && isset($parts[$index + 1])) {
+				$token = $parts[$index + 1];
+				break;
+			}
+		}
+
+		if ($token && ($user = $this->users->getByAvatarToken($token)) && ($path = $this->users->avatarPath($user))) {
+			header('Content-Type: ' . $this->users->avatarMimeType($path));
+			header('Cache-Control: public, max-age=86400');
+			readfile($path);
+			return;
+		}
+
 		header('Content-Type: image/svg+xml; charset=utf-8');
 		echo Avatar::beam($_SERVER['REQUEST_URI'] ?? '', ['colors' => ['#009', '#ccf', '#9cf']]);
 	}

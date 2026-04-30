@@ -23,7 +23,7 @@
 	<?php $quota = $users->quota($user); ?>
 
 		<tr>
-			<td><img src="{$user.avatar_url}" alt="" /></td>
+			<td><img src="{$user.avatar_url}" alt="" class="avatar" /></td>
 			<th>{$user.login}</th>
 			<td>
 				{{%used used out of %total} used=$quota.used|format_bytes total=$quota.total|format_bytes}<br />

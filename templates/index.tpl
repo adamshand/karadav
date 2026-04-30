@@ -2,7 +2,7 @@
 {include file="_header.tpl" current="index"}
 
 <h3>
-	Hello, {$logged_user.login} ! <img src="{$logged_user.avatar_url}" alt="" />
+	Hello, {$logged_user.login} ! <img src="{$logged_user.avatar_url}" alt="" class="avatar" />
 </h3>
 
 <dl>

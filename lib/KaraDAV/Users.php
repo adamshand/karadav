@@ -2,7 +2,17 @@
 
 namespace KaraDAV;
 
+use KD2\Graphics\Image;
 use stdClass;
+
+const AVATAR_MAX_SIZE = 2 * 1024 * 1024;
+const AVATAR_SIZE = 256;
+const AVATAR_MIME_TYPES = [
+	'image/jpeg' => 'jpg',
+	'image/png'  => 'png',
+	'image/gif'  => 'gif',
+	'image/webp' => 'webp',
+];
 
 class Users
 {
@@ -84,7 +94,11 @@ class Users
 			$user->path = rtrim(realpath($user->path), '/') . '/';
 
 			$user->dav_url = WWW_URL . 'files/' . $user->login . '/';
-			$user->avatar_url = WWW_URL . 'avatars/' . substr(md5($user->login), 0, 16);
+			$user->avatar_url = WWW_URL . 'avatars/' . $this->avatarToken($user);
+
+			if ($avatar = $this->avatarPath($user)) {
+				$user->avatar_url .= '?v=' . filemtime($avatar);
+			}
 		}
 
 		return $user;
@@ -96,6 +110,109 @@ class Users
 		$hash = password_hash(trim($password), \PASSWORD_DEFAULT);
 		DB::getInstance()->run('INSERT OR IGNORE INTO users (login, password, quota, is_admin) VALUES (?, ?, ?, ?);',
 			$login, $hash, $quota * 1024 * 1024, $is_admin ? 1 : 0);
+	}
+
+	public function avatarToken(stdClass $user): string
+	{
+		return substr(md5($user->login), 0, 16);
+	}
+
+	protected function avatarBasePath(stdClass $user): string
+	{
+		return CACHE_PATH . '/avatars/' . $user->id;
+	}
+
+	public function avatarPath(stdClass $user): ?string
+	{
+		$files = glob($this->avatarBasePath($user) . '.*');
+		return $files[0] ?? null;
+	}
+
+	public function avatarMimeType(string $path): string
+	{
+		$extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+		$mime = array_search($extension, AVATAR_MIME_TYPES, true);
+		return is_string($mime) ? $mime : 'application/octet-stream';
+	}
+
+	public function getByAvatarToken(string $token): ?stdClass
+	{
+		$token = preg_replace('/\.(?:jpe?g|png|gif|webp)$/i', '', $token);
+
+		if (preg_match('/^[a-f0-9]{16}$/', $token)) {
+			foreach (DB::getInstance()->iterate('SELECT id, login FROM users;') as $user) {
+				if ($token === $this->avatarToken($user)) {
+					return $this->getById($user->id);
+				}
+			}
+		}
+
+		return $this->makeUserObjectGreatAgain($this->fetch($token));
+	}
+
+	public function saveAvatarFromUpload(stdClass $user, ?array $file): bool
+	{
+		$error = $file['error'] ?? UPLOAD_ERR_NO_FILE;
+
+		if (!$file || $error === UPLOAD_ERR_NO_FILE) {
+			return false;
+		}
+
+		if ($error !== UPLOAD_ERR_OK) {
+			throw new UserException(_('Avatar upload failed.'));
+		}
+
+		if (($file['size'] ?? 0) > AVATAR_MAX_SIZE) {
+			throw new UserException(_('Avatar file is too large.'));
+		}
+
+		$tmp = $file['tmp_name'] ?? null;
+
+		if (!$tmp || !is_uploaded_file($tmp)) {
+			throw new UserException(_('Invalid avatar upload.'));
+		}
+
+		$info = @getimagesize($tmp);
+		$mime = $info['mime'] ?? null;
+
+		if (!$mime || !isset(AVATAR_MIME_TYPES[$mime])) {
+			throw new UserException(_('Avatar must be a JPEG, PNG, GIF or WebP image.'));
+		}
+
+		$dir = CACHE_PATH . '/avatars';
+
+		if (!file_exists($dir)) {
+			mkdir($dir, 0770, true);
+		}
+
+		$this->deleteAvatar($user);
+		$target = $this->avatarBasePath($user) . '.' . AVATAR_MIME_TYPES[$mime];
+		$format = $mime === 'image/jpeg' ? 'jpeg' : AVATAR_MIME_TYPES[$mime];
+
+		try {
+			$image = new Image($tmp, ['jpeg_quality' => 85, 'webp_quality' => 85]);
+			$image->cropResize(AVATAR_SIZE, AVATAR_SIZE);
+
+			if (!$image->save($target, $format)) {
+				throw new \RuntimeException('Could not resize avatar');
+			}
+		}
+		catch (\Throwable $e) {
+			// If GD/Imagick is not available, still accept the avatar and rely on CSS
+			// to display it at a sane size.
+			if (!move_uploaded_file($tmp, $target)) {
+				throw new UserException(_('Could not save avatar.'));
+			}
+		}
+
+		return true;
+	}
+
+	public function deleteAvatar(stdClass $user): void
+	{
+		foreach (glob($this->avatarBasePath($user) . '.*') as $file) {
+			@unlink($file);
+		}
 	}
 
 	public function edit(int $id, array $data)
@@ -409,6 +526,7 @@ class Users
 
 	public function delete(?stdClass $user)
 	{
+		$this->deleteAvatar($user);
 		Storage::deleteDirectory($user->path);
 		DB::getInstance()->run('DELETE FROM users WHERE id = ?;', $user->id);
 	}

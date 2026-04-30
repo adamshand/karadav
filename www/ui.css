@@ -304,8 +304,15 @@ p.info tt {
 	padding: .2em;
 }
 
-h3 img {
+.avatar {
+	width: 64px;
+	height: 64px;
+	object-fit: cover;
+	border-radius: 50%;
 	vertical-align: middle;
+}
+
+h3 img.avatar {
 	margin: 0 1em;
 }
 
