@@ -607,7 +607,7 @@ class Server
 	{
 		// We only care about properties if the client asked for it
 		// If not, we consider that the client just requested to get everything
-		if (!preg_match('!<(?:\w+:)?propfind!', $body)) {
+		if (!preg_match('!<(?:\w+:)?(?:propfind|searchrequest)!', $body)) {
 			return null;
 		}
 
@@ -682,6 +682,261 @@ class Server
 		}
 
 		throw new Exception('Invalid request method', 405);
+	}
+
+	public function http_search(string $uri): ?string
+	{
+		$body = file_get_contents('php://input');
+
+		if (false !== strpos($body, '<!DOCTYPE ')) {
+			throw new Exception('Invalid XML', 400);
+		}
+
+		if (!preg_match('!<(?:\w+:)?basicsearch[\s>]!i', $body)) {
+			throw new Exception('Unsupported SEARCH request', 501);
+		}
+
+		$requested = $this->extractRequestedProperties($body) ?? [];
+		$requested_keys = array_keys($requested) ?: self::BASIC_PROPERTIES;
+
+		if (!preg_match('!<(?:\w+:)?href>([^<]+)</(?:\w+:)?href>!i', $body, $match)) {
+			throw new Exception('Invalid SEARCH request', 400);
+		}
+
+		$href = rawurldecode(trim(html_entity_decode($match[1], ENT_XML1), '/'));
+
+		// Nextcloud media search uses /files/{user}/{path} inside /remote.php/dav.
+		$href_base = '';
+
+		if (preg_match('!^(files/[^/]+)/?(.*)$!', $href, $match)) {
+			$href_base = $match[1];
+			$search_uri = trim($match[2], '/');
+		}
+		else {
+			$search_uri = trim($href, '/');
+		}
+
+		if (!$this->storage->exists($search_uri)) {
+			throw new Exception('This does not exist', 404);
+		}
+
+		$nresults = 0;
+
+		if (preg_match('!<(?:\w+:)?nresults>(\d+)</(?:\w+:)?nresults>!i', $body, $match)) {
+			$nresults = (int) $match[1];
+		}
+
+		$filter_keys = array_unique(array_merge($requested_keys, [
+			'DAV::getcontenttype',
+			'DAV::getlastmodified',
+			'DAV::resourcetype',
+		]));
+
+		$items = [];
+		$before = $this->extractSearchTimestamp($body, 'lt');
+		$after = $this->extractSearchTimestamp($body, 'gt');
+		$this->searchMedia($search_uri, $filter_keys, $items, null, $href_base, $after, $before);
+
+		uasort($items, function ($a, $b) {
+			$ad = $a['DAV::getlastmodified'] ?? null;
+			$bd = $b['DAV::getlastmodified'] ?? null;
+			$at = $ad instanceof \DateTimeInterface ? $ad->getTimestamp() : 0;
+			$bt = $bd instanceof \DateTimeInterface ? $bd->getTimestamp() : 0;
+
+			return $bt <=> $at;
+		});
+
+		if ($nresults > 0) {
+			$items = array_slice($items, 0, $nresults, true);
+		}
+
+		header('HTTP/1.1 207 Multi-Status', true);
+		$this->dav_header();
+		header('Content-Type: application/xml; charset=utf-8');
+
+		return $this->renderMultistatus($items, $requested, $requested_keys, true);
+	}
+
+	protected function extractSearchTimestamp(string $body, string $operator): ?int
+	{
+		if (!preg_match_all(sprintf('!<(?:\\w+:)?%s>.*?</(?:\\w+:)?%1$s>!is', preg_quote($operator, '!')), $body, $matches)) {
+			return null;
+		}
+
+		foreach ($matches[0] as $part) {
+			if (!preg_match('!<(?:\\w+:)?(?:getlastmodified|metadata-photos-original_date_time)\\s*/>!i', $part)) {
+				continue;
+			}
+
+			if (!preg_match('!<(?:\\w+:)?literal>([^<]+)</(?:\\w+:)?literal>!i', $part, $match)) {
+				continue;
+			}
+
+			$value = trim($match[1]);
+
+			if (is_numeric($value)) {
+				return (int) $value;
+			}
+
+			$time = strtotime($value);
+			return false === $time ? null : $time;
+		}
+
+		return null;
+	}
+
+	protected function searchMedia(string $uri, array $properties, array &$items, ?int $limit = null, string $href_base = '', ?int $after = null, ?int $before = null): void
+	{
+		foreach ($this->storage->list($uri, $properties) as $file => $props) {
+			$path = trim($uri . '/' . $file, '/');
+			$props = $this->storage->propfind($path, $properties, 0);
+
+			if (!$props) {
+				continue;
+			}
+
+			if (($props['DAV::resourcetype'] ?? null) == 'collection') {
+				$this->searchMedia($path, $properties, $items, $limit, $href_base, $after, $before);
+
+				if (null !== $limit && count($items) >= $limit) {
+					return;
+				}
+
+				continue;
+			}
+
+			$type = $props['DAV::getcontenttype'] ?? '';
+
+			if (!preg_match('!^(?:image|video)/!i', $type)) {
+				continue;
+			}
+
+			$date = $props['DAV::getlastmodified'] ?? null;
+			$timestamp = $date instanceof \DateTimeInterface ? $date->getTimestamp() : null;
+
+			if (null !== $timestamp && null !== $after && $timestamp <= $after) {
+				continue;
+			}
+
+			if (null !== $timestamp && null !== $before && $timestamp >= $before) {
+				continue;
+			}
+
+			$items[trim($href_base . '/' . trim($path, '/'), '/')] = $props;
+
+			if (null !== $limit && count($items) >= $limit) {
+				return;
+			}
+		}
+	}
+
+	protected function renderMultistatus(array $items, ?array $requested, ?array $requested_keys, bool $omit_missing = false): string
+	{
+		$root_namespaces = [
+			'DAV:' => 'd',
+			'http://owncloud.org/ns' => 'oc',
+			'http://nextcloud.org/ns' => 'nc',
+			'http://open-collaboration-services.org/ns' => 'ocs',
+			'http://open-cloud-mesh.org/ns' => 'ocm',
+			'urn:uuid:c2f41010-65b3-11d1-a29f-00aa00c14882/' => 'ns0',
+		];
+
+		$i = 0;
+		$requested ??= [];
+
+		foreach ($requested as $prop) {
+			if ($prop['ns_url'] == 'DAV:' || !$prop['ns_url']) {
+				continue;
+			}
+
+			if (!array_key_exists($prop['ns_url'], $root_namespaces)) {
+				$root_namespaces[$prop['ns_url']] = $prop['ns_alias'] ?: 'rns' . $i++;
+			}
+		}
+
+		$out = '<?xml version="1.0" encoding="utf-8"?>';
+		$out .= '<d:multistatus';
+
+		foreach ($root_namespaces as $url => $alias) {
+			$out .= sprintf(' xmlns:%s="%s"', $alias, $url);
+		}
+
+		$out .= '>';
+
+		foreach ($items as $uri => $item) {
+			$uri = trim(rtrim($this->base_uri, '/') . '/' . ltrim($uri, '/'), '/');
+			$path = '/' . str_replace('%2F', '/', rawurlencode($uri));
+			$e = sprintf('<d:response><d:href>%s</d:href><d:propstat><d:prop>', htmlspecialchars($path, ENT_XML1));
+
+			foreach ($item as $name => $value) {
+				if (null === $value) {
+					continue;
+				}
+
+				$pos = strrpos($name, ':');
+				$ns = substr($name, 0, $pos);
+				$tag_name = substr($name, $pos + 1);
+				$alias = $root_namespaces[$ns] ?? null;
+				$attributes = '';
+
+				if ($name == 'DAV::resourcetype' && $value == 'collection') {
+					$value = '<d:collection />';
+				}
+				elseif ($name == 'DAV::getetag' && strlen($value) && $value[0] != '"') {
+					$value = '"' . $value . '"';
+				}
+				elseif ($value instanceof \DateTimeInterface) {
+					$value = clone $value;
+					$value->setTimezone(new \DateTimeZone('GMT'));
+					$value = $value->format(self::DATE_RFC7231);
+				}
+				elseif (is_array($value)) {
+					$attributes = $value['attributes'] ?? '';
+					$value = $value['xml'] ?? null;
+				}
+				else {
+					$value = htmlspecialchars($value, ENT_XML1);
+				}
+
+				if (!$ns) {
+					$attributes .= ' xmlns=""';
+				}
+				else {
+					$tag_name = $alias . ':' . $tag_name;
+				}
+
+				if (null === $value || self::EMPTY_PROP_VALUE === $value) {
+					$e .= sprintf('<%s%s />', $tag_name, $attributes ? ' ' . $attributes : '');
+				}
+				else {
+					$e .= sprintf('<%s%s>%s</%1$s>', $tag_name, $attributes ? ' ' . $attributes : '', $value);
+				}
+			}
+
+			$e .= '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>';
+
+			if (!$omit_missing && !empty($requested)) {
+				$missing_properties = array_diff($requested_keys, array_keys($item));
+
+				if (count($missing_properties)) {
+					$e .= '<d:propstat><d:prop>';
+
+					foreach ($missing_properties as $name) {
+						$pos = strrpos($name, ':');
+						$ns = substr($name, 0, $pos);
+						$name = substr($name, $pos + 1);
+						$alias = $root_namespaces[$ns] ?? null;
+						$e .= $alias ? sprintf('<%s:%s />', $alias, $name) : sprintf('<%s xmlns="" />', $name);
+					}
+
+					$e .= '</d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>';
+				}
+			}
+
+			$out .= $e . '</d:response>' . "\n";
+		}
+
+		return $out . '</d:multistatus>';
 	}
 
 	public function http_propfind(string $uri): ?string

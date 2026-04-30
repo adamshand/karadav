@@ -229,7 +229,7 @@ class Storage extends AbstractStorage implements TrashInterface
 				// We are not returning OC checksums as this could slow directory listings
 				return null;
 			case NextCloud::PROP_NC_HAS_PREVIEW:
-				if (preg_match('!\.(?:webp|jpe?g|gif|png)$i!', $uri)) {
+				if (preg_match('!\.(?:webp|jpe?g|gif|png)$!i', $uri)) {
 					return 'true';
 				}
 
