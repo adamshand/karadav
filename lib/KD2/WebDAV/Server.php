@@ -671,14 +671,27 @@ class Server
 		}
 
 		// Nextcloud clients use REPORT with oc:filter-files to list favorites
-		// recursively. KaraDAV does not currently track favorites, so return an
-		// empty multistatus instead of a 405, otherwise mobile clients may keep
-		// retrying the request.
+		// recursively. Return the persisted favorites if requested instead of a
+		// 405, otherwise mobile clients may keep retrying the request.
 		if (false !== strpos($body, 'filter-files')) {
+			$requested = $this->extractRequestedProperties($body) ?? [];
+			$requested_keys = array_keys($requested) ?: self::BASIC_PROPERTIES;
+			$items = [];
+
+			if (preg_match('!<(?:\w+:)?favorite>1</(?:\w+:)?favorite>!i', $body)) {
+				$filter_keys = array_unique(array_merge($requested_keys, [
+					'DAV::resourcetype',
+					'http://owncloud.org/ns:favorite',
+				]));
+
+				$this->searchPropertyEquals($uri, $filter_keys, 'http://owncloud.org/ns:favorite', '1', $items);
+			}
+
 			header('HTTP/1.1 207 Multi-Status', true);
 			$this->dav_header();
 			header('Content-Type: application/xml; charset=utf-8');
-			return '<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" />';
+
+			return $this->renderMultistatus($items, $requested, $requested_keys, true);
 		}
 
 		throw new Exception('Invalid request method', 405);
@@ -783,6 +796,32 @@ class Server
 		}
 
 		return null;
+	}
+
+	protected function searchPropertyEquals(string $uri, array $properties, string $property, string $value, array &$items): void
+	{
+		foreach ($this->storage->list($uri, $properties) as $file => $props) {
+			$path = trim($uri . '/' . $file, '/');
+			$props = $this->storage->propfind($path, $properties, 0);
+
+			if (!$props) {
+				continue;
+			}
+
+			$current = $props[$property] ?? null;
+
+			if (is_array($current)) {
+				$current = $current['xml'] ?? null;
+			}
+
+			if ((string) $current === $value) {
+				$items[$path] = $props;
+			}
+
+			if (($props['DAV::resourcetype'] ?? null) == 'collection') {
+				$this->searchPropertyEquals($path, $properties, $property, $value, $items);
+			}
+		}
 	}
 
 	protected function searchMedia(string $uri, array $properties, array &$items, ?int $limit = null, string $href_base = '', ?int $after = null, ?int $before = null): void
@@ -1188,50 +1227,32 @@ class Server
 			throw new Exception('Invalid XML', 400);
 		}
 
-		$_ns = null;
-
-		// Select correct namespace if required
-		if (!empty(key($xml->getDocNameSpaces()))) {
-			$_ns = 'DAV:';
-		}
-
+		$namespaces = $xml->getDocNamespaces(true);
+		$dav_ns = $namespaces['d'] ?? $namespaces['D'] ?? 'DAV:';
 		$out = [];
 
 		// Process set/remove instructions in order (important)
-		foreach ($xml->children($_ns) as $child) {
-			foreach ($child->children($_ns) as $prop) {
-				$prop = $prop->children();
-				if ($child->getName() == 'set') {
-					$ns = $prop->getNamespaces(true);
-					$ns = array_flip($ns);
-					$name = key($ns) . ':' . $prop->getName();
+		foreach ($xml->children($dav_ns) as $instruction) {
+			$action = $instruction->getName();
 
-					$attributes = $prop->attributes();
-					$attributes = $attributes === null ? null : iterator_to_array($attributes);
+			foreach ($instruction->children($dav_ns) as $prop_container) {
+				foreach ($namespaces + ['' => ''] as $ns_url) {
+					foreach ($prop_container->children($ns_url) as $prop) {
+						$name = $ns_url . ':' . $prop->getName();
 
-					foreach ($ns as $xmlns => $alias) {
-						foreach (iterator_to_array($prop->attributes($alias)) as $key => $v) {
-							$attributes[$xmlns . ':' . $key] = $value;
+						if ($action == 'set') {
+							$text = $prop->count() ? $prop->asXML() : (string) $prop;
+
+							if ($prop->count()) {
+								$text = preg_replace('!^<[^>]+>|</[^>]+>$!', '', $text);
+							}
+
+							$out[$name] = ['action' => 'set', 'attributes' => null, 'content' => $text ?: null];
+						}
+						else {
+							$out[$name] = ['action' => 'remove'];
 						}
 					}
-
-					if ($prop->count() > 1) {
-						$text = '';
-
-						foreach ($prop->children() as $c) {
-							$text .= $c->asXML();
-						}
-					}
-					else {
-						$text = (string)$prop;
-					}
-
-					$out[$name] = ['action' => 'set', 'attributes' => $attributes ?: null, 'content' => $text ?: null];
-				}
-				else {
-					$ns = $prop->getNamespaces();
-					$name = current($ns) . ':' . $prop->getName();
-					$out[$name] = ['action' => 'remove'];
 				}
 			}
 		}

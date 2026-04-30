@@ -319,7 +319,8 @@ abstract class NextCloud
 		'ocs/v2.php/core/navigation/apps' => 'empty',
 		'ocs/v2.php/apps/notifications/api/v2/push' => 'empty',
 		'ocs/v2.php/apps/dashboard/api/v1/widgets' => 'empty',
-		'ocs/v2.php/apps/activity/api/v2/activity/all' => 'empty',
+		'ocs/v2.php/apps/activity/api/v2/activity/all' => 'activity',
+		'ocs/v2.php/apps/activity/api/v2/activity/filter' => 'activity',
 		// OpenCloud spaces, see https://github.com/opencloud-eu/android/blob/80764e22f50ab38411b7230c71709430514079e9/opencloudComLibrary/src/main/java/eu/opencloud/android/lib/resources/spaces/GetRemoteSpacesOperation.kt#L96
 		'graph/v1.0/me/drives' => 'opencloud_graph',
 		'index.php/avatar' => 'avatar',
@@ -683,6 +684,103 @@ abstract class NextCloud
 	protected function nc_opencloud_graph(): string
 	{
 		return '{"value":[]}';
+	}
+
+	protected function nc_activity(): array
+	{
+		$method = $_SERVER['REQUEST_METHOD'] ?? null;
+
+		if ($method != 'GET') {
+			throw new Exception('Invalid request method', 405);
+		}
+
+		$this->requireAuth();
+
+		$limit = max(1, min(200, (int) ($_GET['limit'] ?? 50)));
+		$since = max(0, (int) ($_GET['since'] ?? 0));
+		$object_id = isset($_GET['object_id']) ? (int) $_GET['object_id'] : null;
+		$items = [];
+		$properties = [
+			'DAV::displayname',
+			'DAV::getlastmodified',
+			'DAV::getcontenttype',
+			'DAV::resourcetype',
+			self::PROP_OC_FILEID,
+		];
+
+		$this->collectActivityFiles('', $properties, $items);
+
+		uasort($items, function ($a, $b) {
+			$ad = $a['DAV::getlastmodified'] ?? null;
+			$bd = $b['DAV::getlastmodified'] ?? null;
+			$at = $ad instanceof \DateTimeInterface ? $ad->getTimestamp() : 0;
+			$bt = $bd instanceof \DateTimeInterface ? $bd->getTimestamp() : 0;
+
+			return $bt <=> $at;
+		});
+
+		$out = [];
+
+		foreach ($items as $path => $props) {
+			$date = $props['DAV::getlastmodified'] ?? null;
+			$timestamp = $date instanceof \DateTimeInterface ? $date->getTimestamp() : 0;
+			$file_id = (int) ($props[self::PROP_OC_FILEID] ?? 0);
+
+			if ($since && $file_id <= $since) {
+				continue;
+			}
+
+			if ($object_id && $file_id !== $object_id) {
+				continue;
+			}
+
+			$name = $props['DAV::displayname'] ?? basename($path);
+
+			$out[] = [
+				'activity_id' => $file_id,
+				'app' => 'files',
+				'type' => 'file_created',
+				'user' => $this->getUserName(),
+				'subject' => sprintf('You created %s', $name),
+				'message' => '',
+				'object_type' => 'files',
+				'object_id' => $file_id,
+				'object_name' => $name,
+				'link' => $this->root_url . 'remote.php/dav/files/' . rawurlencode($this->getUserName() ?? '') . '/' . str_replace('%2F', '/', rawurlencode($path)),
+				'icon' => $this->theme['favicon'] ?? '',
+				'datetime' => $timestamp ? date('c', $timestamp) : date('c'),
+			];
+
+			if (count($out) >= $limit) {
+				break;
+			}
+		}
+
+		$first = $out ? min(array_column($out, 'activity_id')) : 0;
+		$last = $out ? max(array_column($out, 'activity_id')) : 0;
+		header('X-Activity-First-Known: ' . $first);
+		header('X-Activity-Last-Given: ' . $last);
+
+		return $this->nc_ocs($out);
+	}
+
+	protected function collectActivityFiles(string $uri, array $properties, array &$items): void
+	{
+		foreach ($this->storage->list($uri, $properties) as $file => $props) {
+			$path = trim($uri . '/' . $file, '/');
+			$props = $this->storage->propfind($path, $properties, 0);
+
+			if (!$props) {
+				continue;
+			}
+
+			if (($props['DAV::resourcetype'] ?? null) == 'collection') {
+				$this->collectActivityFiles($path, $properties, $items);
+				continue;
+			}
+
+			$items[$path] = $props;
+		}
 	}
 
 	protected function nc_direct_editing(): array
