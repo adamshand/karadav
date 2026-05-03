@@ -118,6 +118,216 @@ class NextCloud extends WebDAV_NextCloud
 		return WebDAV::hmac([$uri, $user->login, $user->password]);
 	}
 
+	public function nc_capabilities(): array
+	{
+		$out = parent::nc_capabilities();
+		$capabilities =& $out['ocs']['data']['capabilities'];
+
+		$capabilities['files_sharing'] = [
+			'api_enabled' => true,
+			'default_permissions' => Shares::PERMISSION_READ,
+			'group_sharing' => false,
+			'resharing' => false,
+			'sharebymail' => [
+				'enabled' => false,
+				'password' => ['enabled' => false, 'enforced' => false],
+			],
+			'public' => [
+				'enabled' => true,
+				'upload' => false,
+				'multiple' => true,
+				'supports_upload_only' => false,
+				'password' => [
+					'enforced' => false,
+					'askForOptionalPassword' => false,
+				],
+				'expire_date' => [
+					'enabled' => true,
+					'enforced' => false,
+					'days' => 0,
+				],
+			],
+		];
+
+		return $out;
+	}
+
+	public function nc_shares(string $uri = ''): array
+	{
+		$this->requireAuth();
+
+		if (!preg_match('!ocs/v2\.php/apps/files_sharing/api/v1/shares(?:/(\d+))?$!', $uri, $match)) {
+			return $this->ocsError('Invalid share endpoint', 404);
+		}
+
+		$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+		$user = $this->users->current();
+		$shares = new Shares;
+		$id = isset($match[1]) ? (int)$match[1] : null;
+
+		if ($method === 'GET') {
+			if ($id) {
+				$share = $shares->get($id, $user->id);
+				return $share ? $this->ocsShare($share) : $this->ocsError('Share not found', 404);
+			}
+
+			$path = isset($_GET['path']) ? $this->normalizeSharePath($_GET['path']) : null;
+
+			if ($path !== null && !$this->storage->exists($path)) {
+				return $this->ocsError('File does not exist', 404);
+			}
+
+			return $this->ocsShares($shares->list($user, $path));
+		}
+
+		if ($method === 'POST' && !$id) {
+			$path = $this->normalizeSharePath($_POST['path'] ?? '');
+			$share_type = (int)($_POST['shareType'] ?? -1);
+
+			if ($path === '') {
+				return $this->ocsError('Sharing the root directory is not supported', 400);
+			}
+
+			if (!$this->storage->exists($path)) {
+				return $this->ocsError('File does not exist', 404);
+			}
+
+			if ($share_type !== Shares::TYPE_PUBLIC_LINK) {
+				return $this->ocsError('KaraDAV currently supports public link shares only', 400);
+			}
+
+			$share = $shares->create($user, $path, Shares::TYPE_PUBLIC_LINK, (int)($_POST['permissions'] ?? Shares::PERMISSION_READ), [
+				'password' => $_POST['password'] ?? '',
+				'expire_date' => $_POST['expireDate'] ?? '',
+				'note' => $_POST['note'] ?? '',
+				'label' => $_POST['label'] ?? '',
+				'hide_download' => $this->requestBool($_POST['hideDownload'] ?? false),
+			]);
+
+			return $this->ocsShare($share);
+		}
+
+		if ($id && $method === 'PUT') {
+			$share = $shares->get($id, $user->id);
+
+			if (!$share) {
+				return $this->ocsError('Share not found', 404);
+			}
+
+			parse_str(file_get_contents('php://input'), $params);
+			$options = [];
+
+			foreach (['permissions', 'password', 'note', 'label'] as $key) {
+				if (array_key_exists($key, $params)) {
+					$options[$key] = $params[$key];
+				}
+			}
+
+			if (array_key_exists('expireDate', $params)) {
+				$options['expire_date'] = $params['expireDate'];
+			}
+
+			if (array_key_exists('hideDownload', $params)) {
+				$options['hide_download'] = $this->requestBool($params['hideDownload']);
+			}
+
+			$share = $shares->update($share, $options);
+
+			return $this->ocsShare($share);
+		}
+
+		if ($id && $method === 'DELETE') {
+			$share = $shares->get($id, $user->id);
+
+			if (!$share) {
+				return $this->ocsError('Share not found', 404);
+			}
+
+			$shares->delete($share);
+			return $this->nc_ocs([], 100);
+		}
+
+		return $this->ocsError('Invalid request method', 405);
+	}
+
+	protected function ocsShares(array $shares): array
+	{
+		return $this->nc_ocs(array_map(fn($share) => $this->shareToOcs($share), $shares), 100);
+	}
+
+	protected function ocsShare(\stdClass $share): array
+	{
+		return $this->nc_ocs($this->shareToOcs($share), 100);
+	}
+
+	protected function ocsError(string $message, int $statuscode): array
+	{
+		return $this->nc_ocs([], $statuscode, 'failure', $message);
+	}
+
+	protected function shareToOcs(\stdClass $share): array
+	{
+		$owner = $this->users->getById((int)$share->user);
+		$path = (string)$share->path;
+		$props = $this->storage->propfind($path, ['DAV::resourcetype', 'DAV::getcontenttype', 'DAV::getcontentlength', self::PROP_OC_FILEID], 0) ?: [];
+		$is_dir = ($props['DAV::resourcetype'] ?? null) === 'collection';
+		$file_id = $props[self::PROP_OC_FILEID] ?? $this->storage->getFileId($path);
+		$name = basename($path);
+		$url = $share->share_type == Shares::TYPE_PUBLIC_LINK ? (new Shares)->publicUrl($share) : '';
+
+		return [
+			'id' => (int)$share->id,
+			'share_type' => (int)$share->share_type,
+			'uid_owner' => $owner->login ?? '',
+			'displayname_owner' => $owner->login ?? '',
+			'permissions' => (int)$share->permissions,
+			'stime' => (int)$share->created,
+			'parent' => '',
+			'expiration' => $share->expire_date ?? '',
+			'token' => $share->token,
+			'uid_file_owner' => $owner->login ?? '',
+			'note' => $share->note ?? '',
+			'label' => $share->label ?? '',
+			'displayname_file_owner' => $owner->login ?? '',
+			'path' => '/' . $path,
+			'item_type' => $is_dir ? 'folder' : 'file',
+			'item_source' => $file_id,
+			'file_source' => $file_id,
+			'file_parent' => '',
+			'file_target' => '/' . $name,
+			'name' => $name,
+			'url' => $url,
+			'mimetype' => $is_dir ? 'httpd/unix-directory' : ($props['DAV::getcontenttype'] ?? 'application/octet-stream'),
+			'storage_id' => 'home::' . ($owner->login ?? ''),
+			'storage' => 0,
+			'item_size' => $props['DAV::getcontentlength'] ?? 0,
+			'share_with' => '',
+			'share_with_displayname' => '',
+			'password' => empty($share->password_hash) ? '' : '********',
+			'send_password_by_talk' => false,
+			'hide_download' => !empty($share->hide_download),
+			'can_edit' => true,
+			'can_delete' => true,
+		];
+	}
+
+	protected function normalizeSharePath(string $path): string
+	{
+		$path = trim(rawurldecode($path));
+		$path = trim($path, '/');
+
+		if (str_contains($path, '..')) {
+			throw new WebDAV_Exception('Invalid share path', 400);
+		}
+
+		return $path;
+	}
+
+	protected function requestBool($value): bool
+	{
+		return in_array($value, [true, 1, '1', 'true', 'yes', 'on'], true);
+	}
+
 	protected function cleanChunks(): void
 	{
 		$expire = time() - 36*3600;
