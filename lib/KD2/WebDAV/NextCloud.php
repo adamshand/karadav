@@ -314,6 +314,9 @@ abstract class NextCloud
 		'v1.php/cloud/user' => 'user',
 		'ocs/v1.php/config' => 'config',
 		'ocs/v2.php/apps/files/api/v1/directEditing' => 'direct_editing',
+		'ocs/v1.php/apps/files_sharing/api/v1/sharees' => 'sharees',
+		'ocs/v2.php/apps/files_sharing/api/v1/sharees' => 'sharees',
+		'ocs/v1.php/apps/files_sharing/api/v1/shares' => 'shares',
 		'ocs/v2.php/apps/files_sharing/api/v1/shares' => 'shares',
 		'ocs/v2.php/apps/user_status' => 'empty',
 		'ocs/v2.php/core/navigation/apps' => 'empty',
@@ -438,6 +441,7 @@ abstract class NextCloud
 		$out = '';
 
 		foreach ($array as $key => $v) {
+			$key = is_int($key) ? 'element' : $key;
 			$out .= '<' . $key .'>';
 
 			if (is_array($v)) {
@@ -685,9 +689,14 @@ abstract class NextCloud
 		]);
 	}
 
-	public function nc_shares(): array
+	public function nc_shares(string $uri = ''): array
 	{
 		return $this->nc_ocs([]);
+	}
+
+	public function nc_sharees(): array
+	{
+		return $this->nc_ocs(['exact' => [], 'users' => [], 'groups' => [], 'remotes' => [], 'emails' => [], 'lookup' => []]);
 	}
 
 	protected function nc_empty(): array
@@ -927,10 +936,10 @@ abstract class NextCloud
 		$this->server->http_get($uri);
 	}
 
-	protected function nc_ocs(array $data = []): array
+	protected function nc_ocs(array $data = [], int $statuscode = 200, string $status = 'ok', string $message = 'OK'): array
 	{
 		return ['ocs' => [
-			'meta' => ['status' => 'ok', 'statuscode' => 200, 'message' => 'OK'],
+			'meta' => ['status' => $status, 'statuscode' => $statuscode, 'message' => $message],
 			'data' => $data,
 		]];
 	}

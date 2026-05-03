@@ -270,6 +270,7 @@ class Storage extends AbstractStorage implements TrashInterface
 
 				if (is_readable($target)) {
 					$permissions[] = NextCloud::PERM_READ;
+					$permissions[] = NextCloud::PERM_SHARE;
 				}
 
 				return implode('', $permissions);

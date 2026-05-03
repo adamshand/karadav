@@ -4,7 +4,7 @@ namespace KaraDAV;
 
 class DB extends \SQLite3
 {
-	const VERSION = 3;
+	const VERSION = 4;
 
 	static protected $instance;
 
@@ -115,6 +115,12 @@ class DB extends \SQLite3
 			$this->exec('END;');
 		}
 
-		$db->exec('PRAGMA user_version = ' . self::VERSION . ';');
+		if ($db_version < 4) {
+			$this->exec('BEGIN;');
+			$this->exec(file_get_contents(ROOT . '/sql/migrate_0004.sql'));
+			$this->exec('END;');
+		}
+
+		$this->exec('PRAGMA user_version = ' . self::VERSION . ';');
 	}
 }
