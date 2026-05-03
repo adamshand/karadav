@@ -6,7 +6,7 @@ services:
     container_name: karadav
     working_dir: /app
     ports:
-      - "8080:8080"
+      - "8443:8080"
     volumes:
       - .:/app
     command: php -S 0.0.0.0:8080 -t /app/www /app/www/_router.php
