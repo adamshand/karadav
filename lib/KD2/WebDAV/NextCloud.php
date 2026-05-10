@@ -411,11 +411,15 @@ abstract class NextCloud
 			return true;
 		}
 
-		// This route is XML only
-		if ($route == 'shares') {
+		// The OCS shares endpoint historically returned XML unless callers passed
+		// format=json. The macOS Nextcloud File Provider asks for JSON with only an
+		// Accept header and aborts the transfer when it receives XML here.
+		if ($route == 'shares' && !$this->wantsJsonResponse()) {
 			http_response_code(200);
 			header('Content-Type: text/xml; charset=utf-8', true);
-			echo '<?xml version="1.0"?>' . $this->xml($v);
+			$xml = '<?xml version="1.0"?>' . $this->xml($v);
+			echo $xml;
+			$this->server->log("NC => Body:\n%s", $xml);
 		}
 		elseif (is_array($v) || is_object($v)) {
 			http_response_code(200);
@@ -434,6 +438,14 @@ abstract class NextCloud
 		$this->server->log('NC Sent response: %d', http_response_code());
 
 		return true;
+	}
+
+	protected function wantsJsonResponse(): bool
+	{
+		$format = strtolower((string)($_GET['format'] ?? ''));
+		$accept = strtolower((string)($_SERVER['HTTP_ACCEPT'] ?? ''));
+
+		return $format === 'json' || str_contains($accept, 'application/json');
 	}
 
 	protected function xml(array $array): string

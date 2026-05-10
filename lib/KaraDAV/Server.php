@@ -43,6 +43,10 @@ class Server
 			return $this->servePublicShare($match[1], $match[2] ?? '', $relative_uri);
 		}
 
+		if (preg_match('!^index\.php/f/(\d+)$!', trim($relative_uri, '/'), $match)) {
+			return $this->servePrivateFileLink((int)$match[1]);
+		}
+
 		$this->nc->setServer($this->dav);
 
 		if ($r = $this->nc->route($relative_uri)) {
@@ -72,6 +76,39 @@ class Server
 		$this->dav->setBaseURI($base . '/files/' . $user->login . '/');
 
 		return $this->dav->route($uri);
+	}
+
+	protected function servePrivateFileLink(int $file_id): bool
+	{
+		$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+		if (!in_array($method, ['GET', 'HEAD'], true)) {
+			http_response_code(405);
+			return true;
+		}
+
+		$user = $this->users->login($_SERVER['PHP_AUTH_USER'] ?? null, $_SERVER['PHP_AUTH_PW'] ?? null)
+			?? $this->users->appSessionLogin($_SERVER['PHP_AUTH_USER'] ?? null, $_SERVER['PHP_AUTH_PW'] ?? null);
+
+		if (!$user) {
+			http_response_code(401);
+			header('WWW-Authenticate: Basic realm="Please login"');
+			echo 'This private link requires access to the file.';
+			return true;
+		}
+
+		$this->users->setCurrent($user->login);
+		$path = $this->dav->getStorage()->getFilePathFromId($file_id);
+
+		if (!$path) {
+			http_response_code(404);
+			echo 'File not found';
+			return true;
+		}
+
+		header('Location: ' . WWW_URL . 'files/' . rawurlencode($user->login) . '/' . $this->encodePath($path));
+		http_response_code(302);
+		return true;
 	}
 
 	protected function servePublicShare(string $token, string $subpath, string $relative_uri): bool

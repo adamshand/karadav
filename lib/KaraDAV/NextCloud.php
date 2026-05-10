@@ -244,7 +244,7 @@ class NextCloud extends WebDAV_NextCloud
 			}
 
 			$shares->delete($share);
-			return $this->nc_ocs([], 100);
+			return $this->nc_ocs([], 200);
 		}
 
 		return $this->ocsError('Invalid request method', 405);
@@ -252,12 +252,12 @@ class NextCloud extends WebDAV_NextCloud
 
 	protected function ocsShares(array $shares): array
 	{
-		return $this->nc_ocs(array_map(fn($share) => $this->shareToOcs($share), $shares), 100);
+		return $this->nc_ocs(array_map(fn($share) => $this->shareToOcs($share), $shares), 200);
 	}
 
 	protected function ocsShare(\stdClass $share): array
 	{
-		return $this->nc_ocs($this->shareToOcs($share), 100);
+		return $this->nc_ocs($this->shareToOcs($share), 200);
 	}
 
 	protected function ocsError(string $message, int $statuscode): array
