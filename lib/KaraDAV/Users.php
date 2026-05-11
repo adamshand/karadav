@@ -469,30 +469,67 @@ class Users
 		}
 
 		if (!$app_password) {
+			$this->logAppSessionFailure('missing app password', $login, null);
 			return null;
 		}
 
 		$token = strtok($app_password, ':');
 		$password = strtok('');
 
-		$user = DB::getInstance()->first('SELECT s.password AS app_hash, u.*
+		if (!is_string($token) || $token === '' || !is_string($password)) {
+			$this->logAppSessionFailure('malformed app password', $login, is_string($token) ? $token : null);
+			return null;
+		}
+
+		$user = DB::getInstance()->first('SELECT s.password AS app_hash, s.expiry AS app_expiry, u.*
 			FROM app_sessions s INNER JOIN users u ON u.id = s.user
-			WHERE s.token = ? AND s.expiry > datetime();', $token);
+			WHERE s.token = ?;', $token);
 
 		if (!$user) {
+			$this->logAppSessionFailure('unknown token', $login, $token);
+			return null;
+		}
+
+		if (strtotime((string)$user->app_expiry) <= time()) {
+			$this->logAppSessionFailure('expired token', $login, $token);
 			return null;
 		}
 
 		$password = trim($password) . $user->password;
 
 		if (!password_verify($password, $user->app_hash)) {
+			$this->logAppSessionFailure('password mismatch', $login, $token);
 			return null;
 		}
+
+		// Treat app passwords as active sessions: as long as a client keeps using
+		// them, keep them alive. This prevents quiet expiry of otherwise healthy
+		// desktop/mobile clients after the initial login-flow lifetime.
+		DB::getInstance()->run('UPDATE app_sessions SET expiry = datetime(\'now\', \'+1 month\') WHERE token = ?;', $token);
 
 		@session_start();
 		$_SESSION['user'] = $user;
 
 		return $this->makeUserObjectGreatAgain($user);
+	}
+
+	protected function logAppSessionFailure(string $reason, ?string $login, ?string $token): void
+	{
+		if (!defined(__NAMESPACE__ . '\\LOG_FILE') || !LOG_FILE) {
+			return;
+		}
+
+		$uri = $_SERVER['REQUEST_URI'] ?? '';
+		$ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+		$token_hint = $token ? substr($token, 0, 8) . '…' : 'none';
+
+		http_log('AUTH: app session rejected: %s (login=%s token=%s uri=%s ua=%s)',
+			$reason,
+			$login ?? 'none',
+			$token_hint,
+			$uri,
+			$ua
+		);
 	}
 
 	public function quota(?stdClass $user = null, bool $with_trash = false): stdClass

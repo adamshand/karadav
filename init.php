@@ -174,13 +174,25 @@ else {
 	$db->upgradeVersion();
 }
 
+function http_log_redact(string $msg): string
+{
+	// Debug logs are often used while troubleshooting client auth flows. Keep
+	// enough information to diagnose request shape, but never persist bearer
+	// credentials, app passwords, or session cookies.
+	$msg = preg_replace('/(^|\n)(\s*Authorization:\s*)[^\n]+/i', '$1$2[redacted]', $msg);
+	$msg = preg_replace('/(^|\n)(\s*Cookie:\s*)[^\n]+/i', '$1$2[redacted]', $msg);
+	$msg = preg_replace('/("appPassword"\s*:\s*)"[^"]*"/i', '$1"[redacted]"', $msg);
+
+	return $msg;
+}
+
 function http_log(string $message, ...$params): void
 {
 	if (!LOG_FILE) {
 		return;
 	}
 
-	$msg = vsprintf($message, $params) . "\n\n";
+	$msg = http_log_redact(vsprintf($message, $params)) . "\n\n";
 
 	if (LOG_FILE) {
 		file_put_contents(LOG_FILE, $msg, FILE_APPEND);
