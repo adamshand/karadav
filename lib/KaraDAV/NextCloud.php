@@ -125,7 +125,7 @@ class NextCloud extends WebDAV_NextCloud
 
 		$capabilities['files_sharing'] = [
 			'api_enabled' => true,
-			'default_permissions' => Shares::PERMISSION_READ,
+			'default_permissions' => Shares::PERMISSION_READ | Shares::PERMISSION_SHARE,
 			'group_sharing' => false,
 			'resharing' => false,
 			'sharebymail' => [

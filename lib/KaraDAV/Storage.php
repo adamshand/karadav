@@ -346,7 +346,7 @@ class Storage extends AbstractStorage implements TrashInterface
 
 		if ($name === 'http://open-collaboration-services.org/ns:share-permissions'
 			|| $name === 'http://open-cloud-mesh.org/ns:share-permissions') {
-			return null;
+			return (string) (Shares::PERMISSION_READ | Shares::PERMISSION_SHARE);
 		}
 
 		if (in_array($name, WebDAV::BASIC_PROPERTIES) || in_array($name, WebDAV::EXTENDED_PROPERTIES)) {
