@@ -1,12 +1,20 @@
+---
+networks:
+  caddy:
+    external: true
+
 # simple container for running/testing karadav
 # doesn't include libgd or imagemagick for thumbnail generation
 services:
   karadav:
     image: php:8.3-cli
     container_name: karadav
+    restart: unless-stopped
     working_dir: /app
     ports:
       - "8443:8080"
     volumes:
       - .:/app
     command: php -S 0.0.0.0:8080 -t /app/www /app/www/_router.php
+    networks:
+      - caddy
