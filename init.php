@@ -210,7 +210,7 @@ if (LOG_FILE && isset($_SERVER['REMOTE_ADDR'])) {
 
 	http_log("ROUTER: <= %s %s (User: %s)\nRequest headers:\n  %s",
 		$method,
-		$uri . ($qs ? '?' : '') . $qs,
+		$uri . ($qs ? '?[redacted]' : ''),
 		$_SERVER['PHP_AUTH_USER'] ?? 'none',
 		implode("\n  ", array_map(fn ($v, $k) => $k . ': ' . $v, $headers, array_keys($headers)))
 	);

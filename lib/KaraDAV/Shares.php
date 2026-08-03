@@ -2,6 +2,7 @@
 
 namespace KaraDAV;
 
+use KD2\WebDAV\Exception as WebDAV_Exception;
 use stdClass;
 
 class Shares
@@ -132,14 +133,84 @@ class Shares
 		DB::getInstance()->run('DELETE FROM shares WHERE id = ?;', $share->id);
 	}
 
+	public function deleteForPath(int $user_id, string $path, bool $include_descendants = false): void
+	{
+		if ($include_descendants) {
+			$db = DB::getInstance();
+			$db->run(
+				'DELETE FROM shares WHERE user = ? AND (path = ? OR path LIKE ? ESCAPE \'\\\');',
+				$user_id,
+				$path,
+				$db->getPathLikeExpression($path)
+			);
+		}
+		else {
+			DB::getInstance()->run('DELETE FROM shares WHERE user = ? AND path = ?;', $user_id, $path);
+		}
+	}
+
+	public function reservePasswordAttempt(stdClass $share, string $ip): array
+	{
+		$db = DB::getInstance();
+		$db->exec('BEGIN IMMEDIATE;');
+
+		try {
+			$row = $db->first(
+				'SELECT failures, retry_after FROM share_password_attempts WHERE share_token = ? AND ip = ?;',
+				$share->token,
+				$ip
+			);
+			$now = time();
+
+			if ($row && (int) $row->retry_after > $now) {
+				$db->exec('ROLLBACK;');
+				return ['allowed' => false, 'retry_after' => (int) $row->retry_after - $now];
+			}
+
+			$failures = (int) ($row->failures ?? 0) + 1;
+			$delay = min(60, 2 ** min(6, $failures - 1));
+			$db->run(
+				'INSERT INTO share_password_attempts (share_token, ip, failures, retry_after)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT (share_token, ip) DO UPDATE SET failures = excluded.failures, retry_after = excluded.retry_after;',
+				$share->token,
+				$ip,
+				$failures,
+				$now + $delay
+			);
+			$db->exec('COMMIT;');
+			return ['allowed' => true, 'retry_after' => $delay];
+		}
+		catch (\Throwable $e) {
+			$db->exec('ROLLBACK;');
+			throw $e;
+		}
+	}
+
+	public function clearPasswordFailures(stdClass $share, string $ip): void
+	{
+		DB::getInstance()->run(
+			'DELETE FROM share_password_attempts WHERE share_token = ? AND ip = ?;',
+			$share->token,
+			$ip
+		);
+	}
+
 	public function isExpired(stdClass $share): bool
 	{
 		if (empty($share->expire_date)) {
 			return false;
 		}
 
-		$ts = strtotime($share->expire_date);
-		return $ts !== false && $ts < time();
+		$value = (string) $share->expire_date;
+		$expires = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $value);
+		$errors = \DateTimeImmutable::getLastErrors();
+
+		// Malformed persisted expiration values must fail closed.
+		return !$expires
+			|| ($errors !== false && ($errors['warning_count'] || $errors['error_count']))
+			|| $expires->format('Y-m-d H:i:s') !== $value
+			|| $expires->getTimestamp() < time();
 	}
 
 	public function publicUrl(stdClass $share): string
@@ -165,8 +236,15 @@ class Shares
 			return null;
 		}
 
-		$ts = strtotime($date);
+		$expires = \DateTimeImmutable::createFromFormat('!Y-m-d', $date);
+		$errors = \DateTimeImmutable::getLastErrors();
 
-		return $ts === false ? null : date('Y-m-d H:i:s', $ts);
+		if (!$expires
+			|| ($errors !== false && ($errors['warning_count'] || $errors['error_count']))
+			|| $expires->format('Y-m-d') !== $date) {
+			throw new WebDAV_Exception('Invalid share expiration date; expected YYYY-MM-DD', 400);
+		}
+
+		return $expires->format('Y-m-d H:i:s');
 	}
 }

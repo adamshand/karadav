@@ -6,12 +6,14 @@ use KD2\WebDAV\AbstractStorage;
 use KD2\WebDAV\TrashInterface;
 use KD2\WebDAV\WOPI;
 use KD2\WebDAV\Exception as WebDAV_Exception;
+use stdClass;
 
 class Storage extends AbstractStorage implements TrashInterface
 {
 	protected Users $users;
 	protected NextCloud $nextcloud;
 	protected array $properties = [];
+	protected ?stdClass $quota = null;
 
 	const THUMBNAIL_SIZES = [150, 500, 1200];
 
@@ -33,6 +35,12 @@ class Storage extends AbstractStorage implements TrashInterface
 	{
 		$this->users = $users;
 		$this->nextcloud = $nextcloud;
+	}
+
+	protected function getQuota(): stdClass
+	{
+		$this->quota ??= $this->users->quota($this->users->current());
+		return $this->quota;
 	}
 
 	protected function validateFileName(string $name)
@@ -93,18 +101,33 @@ class Storage extends AbstractStorage implements TrashInterface
 
 	public function list(string $uri, ?array $properties): iterable
 	{
-		$dirs = self::glob($this->users->current()->path . $uri, '/*', \GLOB_ONLYDIR);
-		$dirs = array_map('basename', $dirs);
-		natcasesort($dirs);
+		$path = $this->users->current()->path . $uri;
 
-		$files = self::glob($this->users->current()->path . $uri, '/*');
-		$files = array_map('basename', $files);
-		$files = array_diff($files, $dirs);
-		natcasesort($files);
+		if (!is_dir($path)) {
+			throw new WebDAV_Exception('Collection not found', 404);
+		}
 
-		$files = array_flip(array_merge($dirs, $files));
-		$files = array_map(fn($a) => null, $files);
-		return $files;
+		// Iterate lazily so recursive SEARCH/REPORT budgets are applied before a
+		// single very large directory can be materialized in memory. Keep the
+		// historical directories-first behavior with two bounded-memory passes.
+		foreach ([true, false] as $want_directories) {
+			foreach (new \DirectoryIterator($path) as $entry) {
+				if ($entry->isDot()) {
+					continue;
+				}
+
+				$file = $entry->getFilename();
+
+				// Don't expose trash folder, as it is managed by KaraDAV.
+				if ($file === '.trash' && $uri === '') {
+					continue;
+				}
+
+				if ($entry->isDir() === $want_directories) {
+					yield $file => null;
+				}
+			}
+		}
 	}
 
 	public function get(string $uri): ?array
@@ -150,7 +173,7 @@ class Storage extends AbstractStorage implements TrashInterface
 		return file_exists($this->users->current()->path . $uri);
 	}
 
-	protected function getRecursiveFileProperty(string $uri, string $prop)
+	protected function getRecursiveFileProperty(string $uri, string $prop): ?int
 	{
 		if ($prop === 'size') {
 			$col = 'SUM(size)';
@@ -163,11 +186,22 @@ class Storage extends AbstractStorage implements TrashInterface
 		}
 
 		$db = DB::getInstance();
+		$params = [];
 
-		$sql = sprintf('SELECT %s FROM files WHERE user = ? AND path LIKE ? ESCAPE \'\\\';', $col);
-		$search = $db->getPathLikeExpression($uri);
+		if ($uri === '') {
+			// Shortcut
+			if ($prop === 'size') {
+				return $this->getQuota()->used;
+			}
 
-		return $db->firstColumn($sql, $this->users->current()->id, $search);
+			$sql = sprintf('SELECT %s FROM files WHERE user = ?;', $col);
+		}
+		else {
+			$sql = sprintf('SELECT %s FROM files WHERE user = ? AND path LIKE ? ESCAPE \'\\\';', $col);
+			$params[] = $db->getPathLikeExpression($uri);
+		}
+
+		return $db->firstColumn($sql, $this->users->current()->id, ...$params);
 	}
 
 	public function get_file_property(string $uri, string $name, int $depth)
@@ -188,11 +222,11 @@ class Storage extends AbstractStorage implements TrashInterface
 					$mtime = $this->getRecursiveFileProperty($uri, 'modified');
 				}
 				else {
-					$mtime = filemtime($target);
+					$mtime = null;
 				}
 
-				if (!$mtime) {
-					$mtime = filemtime($target);
+				if (!$mtime && file_exists($target)) {
+					$mtime = @filemtime($target);
 				}
 
 				if (!$mtime) {
@@ -293,9 +327,9 @@ class Storage extends AbstractStorage implements TrashInterface
 
 				return $this->getTrashInfo(basename($uri))['Path'] ?? null;
 			case 'DAV::quota-available-bytes':
-				return $this->users->quota($this->users->current())->free;
+				return $this->getQuota()->free;
 			case 'DAV::quota-used-bytes':
-				return $this->users->quota($this->users->current())->used;
+				return $this->getQuota()->used;
 			case Nextcloud::PROP_OC_SIZE:
 				if (is_dir($target)) {
 					return $this->getRecursiveFileProperty($uri, 'size') ?? 0;
@@ -368,6 +402,13 @@ class Storage extends AbstractStorage implements TrashInterface
 			$properties = array_merge(WebDAV::BASIC_PROPERTIES, ['DAV::getetag', Nextcloud::PROP_OC_ID, Nextcloud::PROP_OC_FILEID]);
 		}
 
+		// Make sure resourcetype is always included, even if not requested,
+		// this ensures directory URLs are correct
+		// see https://github.com/kd2org/karadav/pull/91
+		if (!in_array('DAV::resourcetype', $properties)) {
+			$properties[] = 'DAV::resourcetype';
+		}
+
 		$out = [];
 
 		// Generate a new token for WOPI, and provide also TTL
@@ -412,7 +453,7 @@ class Storage extends AbstractStorage implements TrashInterface
 
 		$delete = false;
 		$size = 0;
-		$quota = $this->users->quota($this->users->current());
+		$quota = $this->getQuota();
 
 		if ($quota->free <= 0) {
 			throw new WebDAV_Exception('Your quota is exhausted', 507);
@@ -459,13 +500,35 @@ class Storage extends AbstractStorage implements TrashInterface
 			throw new WebDAV_Exception('The data sent does not match the supplied SHA1 hash', 400);
 		}
 		else {
-			rename($tmp_file, $target);
+			if (!rename($tmp_file, $target)) {
+				@unlink($tmp_file);
+				throw new WebDAV_Exception('Could not install uploaded file', 500);
+			}
+
+			if (!$new) {
+				(new Shares)->deleteForPath($this->users->current()->id, $uri);
+			}
+		}
+
+		$this->createFileCache($uri);
+
+		return $new;
+	}
+
+	public function createFileCache(string $uri): void
+	{
+		$target = $this->users->current()->path . $uri;
+
+		if (!file_exists($target)) {
+			return;
 		}
 
 		DB::getInstance()->run('REPLACE INTO files (user, path, size, modified) VALUES (?, ?, ?, ?);',
-			$this->users->current()->id, $uri, $size, time());
-
-		return $new;
+			$this->users->current()->id,
+			$uri,
+			filesize($target),
+			filemtime($target)
+		);
 	}
 
 	public function delete(string $uri): void
@@ -477,6 +540,8 @@ class Storage extends AbstractStorage implements TrashInterface
 		if (!file_exists($target)) {
 			throw new WebDAV_Exception('Target does not exist', 404);
 		}
+
+		(new Shares)->deleteForPath($this->users->current()->id, $uri, is_dir($target));
 
 		// Move to trash
 		if (DEFAULT_TRASHBIN_DELAY > 0 && 0 !== strpos($uri, '.trash')) {
@@ -532,7 +597,7 @@ class Storage extends AbstractStorage implements TrashInterface
 		}
 
 		if (false === $move) {
-			$quota = $this->users->quota($this->users->current());
+			$quota = $this->getQuota();
 
 			if (self::getFilesize($source) > $quota->free) {
 				throw new WebDAV_Exception('Your quota is exhausted', 507);
@@ -563,9 +628,12 @@ class Storage extends AbstractStorage implements TrashInterface
 			}
 		}
 		else {
-			$method($source, $target);
+			if (!$method($source, $target)) {
+				throw new WebDAV_Exception(sprintf('Could not %s resource', $method), 500);
+			}
 
 			if ($method === 'rename') {
+				(new Shares)->deleteForPath($this->users->current()->id, $uri, is_dir($target));
 				$this->getResourceProperties($uri)->move($destination);
 			}
 			else {
@@ -576,13 +644,19 @@ class Storage extends AbstractStorage implements TrashInterface
 		$db = DB::getInstance();
 
 		$db->exec('BEGIN;');
-		$db->run('DELETE FROM files WHERE user = ? AND (path = ? OR path LIKE ? OR path = ? OR path LIKE ?);',
+		$db->run('DELETE FROM files WHERE user = ? AND (path = ? OR path LIKE ? ESCAPE \'\\\');',
 			$this->users->current()->id,
 			$destination,
-			$db->getPathLikeExpression($destination),
-			$uri,
-			$db->getPathLikeExpression($uri)
+			$db->getPathLikeExpression($destination)
 		);
+
+		if ($move) {
+			$db->run('DELETE FROM files WHERE user = ? AND (path = ? OR path LIKE ? ESCAPE \'\\\');',
+				$this->users->current()->id,
+				$uri,
+				$db->getPathLikeExpression($uri)
+			);
+		}
 
 		self::indexFiles($this->users->current(), $destination);
 
@@ -667,7 +741,9 @@ class Storage extends AbstractStorage implements TrashInterface
 			$path .= $part . '/';
 		}
 
-		if (!$this->users->current()->quota) {
+		$quota = $this->getQuota();
+
+		if (!$quota->free) {
 			throw new WebDAV_Exception('Your quota is exhausted', 507);
 		}
 
@@ -687,6 +763,7 @@ class Storage extends AbstractStorage implements TrashInterface
 		}
 
 		$db = DB::getInstance();
+		$now = time();
 
 		$db->exec('BEGIN;');
 
@@ -769,19 +846,12 @@ class Storage extends AbstractStorage implements TrashInterface
 		);
 
 		// Root path doesn't exist in database. Keep its synthetic ID inside
-		// 32-bit range: some mobile clients store file IDs in SQLite/int fields
-		// and may silently drop directory listings when this is too large.
+		// 32-bit range because some mobile clients store file IDs in SQLite integers.
 		if (!$id && $path === '') {
 			$id = 1000000000;
 		}
 
 		return $id;
-	}
-
-	static protected function glob(string $path, string $pattern = '', int $flags = 0): array
-	{
-		$path = preg_replace('/[\*\?\[\]]/', '\\\\$0', $path);
-		return glob($path . $pattern, $flags) ?: [];
 	}
 
 	/**
@@ -840,7 +910,17 @@ class Storage extends AbstractStorage implements TrashInterface
 	static public function deleteDirectory(string $path): void
 	{
 		$path = rtrim($path, '/');
+
+		if (is_link($path)) {
+			@unlink($path);
+			return;
+		}
+
 		$path = realpath($path);
+
+		if (!$path || !is_dir($path)) {
+			return;
+		}
 
 		$dir = opendir($path);
 
@@ -852,9 +932,8 @@ class Storage extends AbstractStorage implements TrashInterface
 
 			$f = $path . DIRECTORY_SEPARATOR . $f;
 
-			if (is_dir($f)) {
+			if (is_dir($f) && !is_link($f)) {
 				self::deleteDirectory($f);
-				@rmdir($f);
 			}
 			else {
 				@unlink($f);

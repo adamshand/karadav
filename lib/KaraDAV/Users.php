@@ -430,35 +430,57 @@ class Users
 
 	public function appSessionValidateToken(string $token): ?stdClass
 	{
-		$session = DB::getInstance()->first('SELECT * FROM app_sessions WHERE token = ?;', $token);
+		$db = DB::getInstance();
+		$db->exec('BEGIN IMMEDIATE;');
 
-		if (!$session) {
-			return null;
+		try {
+			$session = $db->first(
+				'SELECT * FROM app_sessions WHERE token = ? AND expiry >= datetime();',
+				$token
+			);
+
+			if (!$session) {
+				$db->exec('ROLLBACK;');
+				return null;
+			}
+
+			// Exchange the login-flow token exactly once while holding the write lock.
+			$password = $this->generatePassword();
+			$user = $this->getById($session->user);
+
+			if (!$user) {
+				$db->exec('ROLLBACK;');
+				return null;
+			}
+
+			$hash = password_hash($password . $user->password, \PASSWORD_DEFAULT);
+			$new_token = self::generatePassword();
+			$db->run('UPDATE app_sessions
+				SET token = ?, password = ?, expiry = datetime(\'now\', \'+1 month\')
+				WHERE token = ? AND expiry >= datetime();',
+				$new_token, $hash, $token);
+
+			if ($db->changes() !== 1) {
+				$db->exec('ROLLBACK;');
+				return null;
+			}
+
+			$db->exec('COMMIT;');
+			$session->token = $new_token;
+			$session->password = $new_token . ':' . $password;
+			$session->user = $user;
+			return $session;
 		}
-
-		// the token can only be exchanged against a session once,
-		// so we set a password and remove the token
-		$session->password = $this->generatePassword();
-
-		// The app password contains the user password hash
-		// this way we can invalidate all sessions if we change
-		// the user password
-		$user = $this->getById($session->user);
-		$hash = password_hash($session->password . $user->password, \PASSWORD_DEFAULT);
-		$session->token = self::generatePassword();
-		$session->password = $session->token . ':' . $session->password;
-
-		DB::getInstance()->run('UPDATE app_sessions
-			SET token = ?, password = ?, expiry = datetime(\'now\', \'+1 month\')
-			WHERE token = ?;',
-			$session->token, $hash, $token);
-
-		$session->user = $user;
-		return $session;
+		catch (\Throwable $e) {
+			$db->exec('ROLLBACK;');
+			throw $e;
+		}
 	}
 
 	public function appSessionLogin(?string $login, ?string $app_password): ?stdClass
 	{
+		$login = null !== $login ? strtolower(trim($login)) : null;
+
 		// From time to time, clean up old sessions
 		if (time() % 100 == 0) {
 			DB::getInstance()->run('DELETE FROM app_sessions WHERE expiry < datetime();');
@@ -481,17 +503,12 @@ class Users
 			return null;
 		}
 
-		$user = DB::getInstance()->first('SELECT s.password AS app_hash, s.expiry AS app_expiry, u.*
+		$user = DB::getInstance()->first('SELECT s.password AS app_hash, u.*
 			FROM app_sessions s INNER JOIN users u ON u.id = s.user
-			WHERE s.token = ?;', $token);
+			WHERE s.token = ? AND u.login = ? AND s.expiry >= datetime();', $token, $login);
 
 		if (!$user) {
 			$this->logAppSessionFailure('unknown token', $login, $token);
-			return null;
-		}
-
-		if (strtotime((string)$user->app_expiry) <= time()) {
-			$this->logAppSessionFailure('expired token', $login, $token);
 			return null;
 		}
 
@@ -511,6 +528,25 @@ class Users
 		$_SESSION['user'] = $user;
 
 		return $this->makeUserObjectGreatAgain($user);
+	}
+
+	public function appSessionDelete(?string $app_password): void
+	{
+		$current = $this->current();
+
+		if (!$current || !$app_password) {
+			return;
+		}
+
+		$token = strtok($app_password, ':');
+
+		if (is_string($token) && $token !== '') {
+			DB::getInstance()->run(
+				'DELETE FROM app_sessions WHERE token = ? AND user = ?;',
+				$token,
+				$current->id
+			);
+		}
 	}
 
 	protected function logAppSessionFailure(string $reason, ?string $login, ?string $token): void

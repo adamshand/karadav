@@ -101,6 +101,10 @@ class Server
 	 */
 	const DATE_RFC7231 = "D, d M Y H:i:s \\G\\M\\T";
 
+	// Recursive DAV queries must not be able to walk an unbounded tree.
+	const MAX_RECURSIVE_SCAN_ITEMS = 10000;
+	const MAX_RECURSION_DEPTH = 64;
+
 	/**
 	 * Enable on-the-fly gzip compression
 	 * This can use a large amount of resources
@@ -684,7 +688,8 @@ class Server
 					'http://owncloud.org/ns:favorite',
 				]));
 
-				$this->searchPropertyEquals($uri, $filter_keys, 'http://owncloud.org/ns:favorite', '1', $items);
+				$scanned = 0;
+				$this->searchPropertyEquals($uri, $filter_keys, 'http://owncloud.org/ns:favorite', '1', $items, $scanned);
 			}
 
 			header('HTTP/1.1 207 Multi-Status', true);
@@ -729,6 +734,10 @@ class Server
 			$search_uri = trim($href, '/');
 		}
 
+		// The search scope comes from the XML body, not the already validated
+		// request URI, so it needs its own traversal check.
+		$search_uri = $this->validateURI($search_uri);
+
 		if (!$this->storage->exists($search_uri)) {
 			throw new Exception('This does not exist', 404);
 		}
@@ -736,7 +745,7 @@ class Server
 		$nresults = 0;
 
 		if (preg_match('!<(?:\w+:)?nresults>(\d+)</(?:\w+:)?nresults>!i', $body, $match)) {
-			$nresults = (int) $match[1];
+			$nresults = min(1000, (int) $match[1]);
 		}
 
 		$filter_keys = array_unique(array_merge($requested_keys, [
@@ -748,7 +757,8 @@ class Server
 		$items = [];
 		$before = $this->extractSearchTimestamp($body, 'lt');
 		$after = $this->extractSearchTimestamp($body, 'gt');
-		$this->searchMedia($search_uri, $filter_keys, $items, null, $href_base, $after, $before);
+		$scanned = 0;
+		$this->searchMedia($search_uri, $filter_keys, $items, $href_base, $after, $before, $scanned);
 
 		uasort($items, function ($a, $b) {
 			$ad = $a['DAV::getlastmodified'] ?? null;
@@ -798,9 +808,17 @@ class Server
 		return null;
 	}
 
-	protected function searchPropertyEquals(string $uri, array $properties, string $property, string $value, array &$items): void
+	protected function searchPropertyEquals(string $uri, array $properties, string $property, string $value, array &$items, int &$scanned, int $depth = 0): void
 	{
+		if ($depth > self::MAX_RECURSION_DEPTH) {
+			throw new Exception('Recursive query is too deep', 507);
+		}
+
 		foreach ($this->storage->list($uri, $properties) as $file => $props) {
+			if (++$scanned > self::MAX_RECURSIVE_SCAN_ITEMS) {
+				throw new Exception('Recursive query scope is too large', 507);
+			}
+
 			$path = trim($uri . '/' . $file, '/');
 			$props = $this->storage->propfind($path, $properties, 0);
 
@@ -819,14 +837,22 @@ class Server
 			}
 
 			if (($props['DAV::resourcetype'] ?? null) == 'collection') {
-				$this->searchPropertyEquals($path, $properties, $property, $value, $items);
+				$this->searchPropertyEquals($path, $properties, $property, $value, $items, $scanned, $depth + 1);
 			}
 		}
 	}
 
-	protected function searchMedia(string $uri, array $properties, array &$items, ?int $limit = null, string $href_base = '', ?int $after = null, ?int $before = null): void
+	protected function searchMedia(string $uri, array $properties, array &$items, string $href_base, ?int $after, ?int $before, int &$scanned, int $depth = 0): void
 	{
+		if ($depth > self::MAX_RECURSION_DEPTH) {
+			throw new Exception('Recursive query is too deep', 507);
+		}
+
 		foreach ($this->storage->list($uri, $properties) as $file => $props) {
+			if (++$scanned > self::MAX_RECURSIVE_SCAN_ITEMS) {
+				throw new Exception('Recursive query scope is too large', 507);
+			}
+
 			$path = trim($uri . '/' . $file, '/');
 			$props = $this->storage->propfind($path, $properties, 0);
 
@@ -835,12 +861,7 @@ class Server
 			}
 
 			if (($props['DAV::resourcetype'] ?? null) == 'collection') {
-				$this->searchMedia($path, $properties, $items, $limit, $href_base, $after, $before);
-
-				if (null !== $limit && count($items) >= $limit) {
-					return;
-				}
-
+				$this->searchMedia($path, $properties, $items, $href_base, $after, $before, $scanned, $depth + 1);
 				continue;
 			}
 
@@ -862,10 +883,6 @@ class Server
 			}
 
 			$items[trim($href_base . '/' . trim($path, '/'), '/')] = $props;
-
-			if (null !== $limit && count($items) >= $limit) {
-				return;
-			}
 		}
 	}
 
@@ -1016,6 +1033,7 @@ class Server
 			throw new Exception('This does not exist', 404);
 		}
 
+		// Fill all the various time properties (for compatibility)
 		if (isset($properties['DAV::getlastmodified'])) {
 			foreach (self::MODIFICATION_TIME_PROPERTIES as $name) {
 				$properties[$name] = $properties['DAV::getlastmodified'];
@@ -1060,7 +1078,7 @@ class Server
 		$requested ??= [];
 
 		foreach ($requested as $prop) {
-			if ($prop['ns_url'] == 'DAV:' || !$prop['ns_url']) {
+			if ($prop['ns_url'] === 'DAV:' || !$prop['ns_url']) {
 				continue;
 			}
 
@@ -1129,7 +1147,7 @@ class Server
 				// see https://github.com/opencloud-eu/android/issues/74
 				if ($name == 'DAV::creationdate'
 					&& ($value instanceof \DateTimeInterface)
-					&& false !== preg_match('/owncloud|opencloud/', $_SERVER['HTTP_USER_AGENT'] ?? '')) {
+					&& preg_match('/(?:owncloud|opencloud).*android/i', $_SERVER['HTTP_USER_AGENT'] ?? '') === 1) {
 					$value = $value->getTimestamp();
 				}
 				// ownCloud app crashes if mimetype is provided for a directory
@@ -1146,10 +1164,19 @@ class Server
 					$value = '"' . $value . '"';
 				}
 				elseif ($value instanceof \DateTimeInterface) {
-					// Change value to GMT
-					$value = clone $value;
-					$value->setTimezone(new \DateTimeZone('GMT'));
-					$value = $value->format(self::DATE_RFC7231);
+					// Format is different between properties
+					if ($name === 'DAV::creationdate') {
+						$format = \DATE_RFC3339;
+					}
+					// Mostly for DAV::getlastmodified
+					else {
+						// Change value to GMT, see https://discourse.thephp.foundation/t/php-dev-was-deprecation-of-date-rfc7231-and-datetimeinterface-rfc7231-a-mistake/5063/4
+						$value = clone $value;
+						$value->setTimezone(new \DateTimeZone('GMT'));
+						$format = self::DATE_RFC7231;
+					}
+
+					$value = $value->format($format);
 				}
 				elseif (is_array($value)) {
 					$attributes = $value['attributes'] ?? '';
@@ -1177,9 +1204,9 @@ class Server
 
 			$e .= '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>' . "\n";
 
-			// Append missing properties. Nextcloud iOS is fragile here and may
-			// ignore a whole listing when optional extension properties are returned
-			// as 404 propstats, so omit missing optional props for that client.
+			// Nextcloud iOS may ignore a whole listing when optional extension
+			// properties are returned as 404 propstats. Other clients still need
+			// standards-compliant missing-property responses.
 			$ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
 			if (!empty($requested) && false === stripos($ua, 'Nextcloud-iOS')) {
 				$missing_properties = array_diff($requested_keys, array_keys($item));

@@ -4,7 +4,7 @@ namespace KaraDAV;
 
 class DB extends \SQLite3
 {
-	const VERSION = 4;
+	const VERSION = 6;
 
 	static protected $instance;
 
@@ -26,6 +26,11 @@ class DB extends \SQLite3
 		parent::__construct(DB_FILE);
 
 		$this->busyTimeout(10 * 1000);
+		$this->exec('PRAGMA foreign_keys = ON;');
+
+		if (!(int) $this->querySingle('PRAGMA foreign_keys;')) {
+			throw new \RuntimeException('SQLite foreign key enforcement could not be enabled');
+		}
 
 		$mode = strtoupper(DB_JOURNAL_MODE);
 		$set_mode = $this->querySingle('PRAGMA journal_mode;');
@@ -80,47 +85,57 @@ class DB extends \SQLite3
 			return '%';
 		}
 
-		return str_replace(['?', '%'], ['\\?', '\\%'], $path) . '/%';
+		return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $path) . '/%';
 	}
 
 	public function upgradeVersion(): void
 	{
 		$db_version = $this->firstColumn('PRAGMA user_version;');
 
+		if ($db_version > self::VERSION) {
+			throw new \RuntimeException(sprintf(
+				'Database version %d is newer than supported version %d',
+				$db_version,
+				self::VERSION
+			));
+		}
+
 		if ($db_version === self::VERSION) {
 			return;
 		}
 
+		$this->exec('BEGIN;');
+
 		if ($db_version < 1) {
-			$this->exec('BEGIN;');
 			$this->exec(file_get_contents(ROOT . '/sql/migrate_0001.sql'));
 
 			$users = new Users;
 			$users->indexAllFiles();
-			$this->exec('END;');
 		}
 
 		// Re-index to create directories in cache
 		if ($db_version < 2) {
-			$this->exec('BEGIN;');
 			$users = new Users;
 			$users->indexAllFiles();
-			$this->exec('PRAGMA user_version = 2;');
-			$this->exec('END;');
 		}
 
 		if ($db_version < 3) {
-			$this->exec('BEGIN;');
 			$this->exec(file_get_contents(ROOT . '/sql/migrate_0003.sql'));
-			$this->exec('END;');
 		}
 
 		if ($db_version < 4) {
-			$this->exec('BEGIN;');
 			$this->exec(file_get_contents(ROOT . '/sql/migrate_0004.sql'));
-			$this->exec('END;');
+		}
+
+		if ($db_version < 5) {
+			$this->exec(file_get_contents(ROOT . '/sql/migrate_0005.sql'));
+		}
+
+		if ($db_version < 6) {
+			$this->exec(file_get_contents(ROOT . '/sql/migrate_0006.sql'));
 		}
 
 		$this->exec('PRAGMA user_version = ' . self::VERSION . ';');
+		$this->exec('END;');
 	}
 }

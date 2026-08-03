@@ -10,8 +10,7 @@ abstract class NextCloud
 
 	/**
 	 * File permissions for NextCloud clients
-	 * @see https://doc.owncloud.com/desktop/next/appendices/architecture.html#server-side-permissions
-	 * @see https://docs.nextcloud.com/server/latest/developer_manual//client_apis/WebDAV/basic.html
+	 * https://web.archive.org/web/20250829204116/https://doc.owncloud.com/desktop/next/appendices/architecture.html#server-side-permissions
 	 *
 	 * R = Shareable
 	 * S = Shared
@@ -313,6 +312,7 @@ abstract class NextCloud
 		'ocs/v1.php/cloud/user' => 'user',
 		'v1.php/cloud/user' => 'user',
 		'ocs/v1.php/config' => 'config',
+		// These routes are required by iOS and macOS clients.
 		'ocs/v2.php/apps/files/api/v1/directEditing' => 'direct_editing',
 		'ocs/v1.php/apps/files_sharing/api/v1/sharees' => 'sharees',
 		'ocs/v2.php/apps/files_sharing/api/v1/sharees' => 'sharees',
@@ -362,6 +362,8 @@ abstract class NextCloud
 	 */
 	public function route(?string $uri = null): bool
 	{
+		$method = $_SERVER['REQUEST_METHOD'] ?? null;
+
 		if (null === $uri) {
 			$uri = $_SERVER['REQUEST_URI'] ?? '/';
 		}
@@ -379,7 +381,6 @@ abstract class NextCloud
 
 		$route = current($route);
 
-		$method = $_SERVER['REQUEST_METHOD'] ?? null;
 		$this->server->log('NC <= %s %s => routed to: %s', $method, $uri, $route);
 
 		try {
@@ -453,7 +454,11 @@ abstract class NextCloud
 		$out = '';
 
 		foreach ($array as $key => $v) {
-			$key = is_int($key) ? 'element' : $key;
+			if (is_int($key)) {
+				// For list arrays, as <0> is not valid XML.
+				$key = 'element';
+			}
+
 			$out .= '<' . $key .'>';
 
 			if (is_array($v)) {
@@ -579,7 +584,8 @@ abstract class NextCloud
 			throw new Exception('Invalid request method', 405);
 		}
 
-		$token = $_POST['token'] ?? $_GET['token'] ?? null;
+		// iOS clients may pass the token in the query string.
+		$token = $_POST['token'] ?? ($_GET['token'] ?? null);
 
 		if (empty($token) || !ctype_alnum($token)) {
 			throw new Exception('Invalid token', 400);
@@ -723,106 +729,20 @@ abstract class NextCloud
 
 	protected function nc_activity(): array
 	{
-		$method = $_SERVER['REQUEST_METHOD'] ?? null;
-
-		if ($method != 'GET') {
+		if (($_SERVER['REQUEST_METHOD'] ?? null) !== 'GET') {
 			throw new Exception('Invalid request method', 405);
 		}
 
 		$this->requireAuth();
 
-		$limit = max(1, min(200, (int) ($_GET['limit'] ?? 50)));
-		$since = max(0, (int) ($_GET['since'] ?? 0));
-		$object_id = isset($_GET['object_id']) ? (int) $_GET['object_id'] : null;
-		$items = [];
-		$properties = [
-			'DAV::displayname',
-			'DAV::getlastmodified',
-			'DAV::getcontenttype',
-			'DAV::resourcetype',
-			self::PROP_OC_FILEID,
-		];
-
-		$this->collectActivityFiles('', $properties, $items);
-
-		uasort($items, function ($a, $b) {
-			$ad = $a['DAV::getlastmodified'] ?? null;
-			$bd = $b['DAV::getlastmodified'] ?? null;
-			$at = $ad instanceof \DateTimeInterface ? $ad->getTimestamp() : 0;
-			$bt = $bd instanceof \DateTimeInterface ? $bd->getTimestamp() : 0;
-
-			return $bt <=> $at;
-		});
-
-		$out = [];
-
-		foreach ($items as $path => $props) {
-			$date = $props['DAV::getlastmodified'] ?? null;
-			$timestamp = $date instanceof \DateTimeInterface ? $date->getTimestamp() : 0;
-			$file_id = (int) ($props[self::PROP_OC_FILEID] ?? 0);
-
-			if ($since && $file_id <= $since) {
-				continue;
-			}
-
-			if ($object_id && $file_id !== $object_id) {
-				continue;
-			}
-
-			$name = $props['DAV::displayname'] ?? basename($path);
-
-			$out[] = [
-				'activity_id' => $file_id,
-				'app' => 'files',
-				'type' => 'file_created',
-				'user' => $this->getUserName(),
-				'subject' => sprintf('You created %s', $name),
-				'message' => '',
-				'object_type' => 'files',
-				'object_id' => $file_id,
-				'object_name' => $name,
-				'link' => $this->root_url . 'remote.php/dav/files/' . rawurlencode($this->getUserName() ?? '') . '/' . str_replace('%2F', '/', rawurlencode($path)),
-				'icon' => $this->theme['favicon'] ?? '',
-				'datetime' => $timestamp ? date('c', $timestamp) : date('c'),
-			];
-
-			if (count($out) >= $limit) {
-				break;
-			}
-		}
-
-		$first = $out ? min(array_column($out, 'activity_id')) : 0;
-		$last = $out ? max(array_column($out, 'activity_id')) : 0;
-		header('X-Activity-First-Known: ' . $first);
-		header('X-Activity-Last-Given: ' . $last);
-
-		return $this->nc_ocs($out);
-	}
-
-	protected function collectActivityFiles(string $uri, array $properties, array &$items): void
-	{
-		foreach ($this->storage->list($uri, $properties) as $file => $props) {
-			$path = trim($uri . '/' . $file, '/');
-			$props = $this->storage->propfind($path, $properties, 0);
-
-			if (!$props) {
-				continue;
-			}
-
-			if (($props['DAV::resourcetype'] ?? null) == 'collection') {
-				$this->collectActivityFiles($path, $properties, $items);
-				continue;
-			}
-
-			$items[$path] = $props;
-		}
+		// KaraDAV has no event history. Returning current files as "created"
+		// activity was misleading and required an unbounded recursive scan.
+		return $this->nc_ocs([]);
 	}
 
 	protected function nc_direct_editing(): array
 	{
-		$method = $_SERVER['REQUEST_METHOD'] ?? null;
-
-		if ($method != 'GET') {
+		if (($_SERVER['REQUEST_METHOD'] ?? null) !== 'GET') {
 			throw new Exception('Invalid request method', 405);
 		}
 
@@ -1054,9 +974,13 @@ abstract class NextCloud
 
 			$this->server->log('Assembling chunks to: %s', $dest);
 
-			$mtime = (int) $_SERVER['HTTP_X_OC_MTIME'] ?: null;
+			$mtime = isset($_SERVER['HTTP_X_OC_MTIME'])
+				? ((int) $_SERVER['HTTP_X_OC_MTIME'] ?: null)
+				: null;
 
-			header('X-OC-MTime: accepted');
+			if ($mtime) {
+				header('X-OC-MTime: accepted');
+			}
 
 			$return = $this->assembleChunks($user, $dir, $dest, $mtime);
 

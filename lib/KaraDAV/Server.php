@@ -135,7 +135,13 @@ class Server
 			return true;
 		}
 
-		if (!$this->checkPublicSharePassword($share)) {
+		if (!((int) $share->permissions & Shares::PERMISSION_READ)) {
+			http_response_code(403);
+			echo 'This share does not allow reading';
+			return true;
+		}
+
+		if (!$this->checkPublicSharePassword($share, $shares)) {
 			return true;
 		}
 
@@ -156,6 +162,16 @@ class Server
 		}
 
 		$target = trim($share->path . ($subpath !== '' ? '/' . $subpath : ''), '/');
+		$owner_root = rtrim($owner->path, DIRECTORY_SEPARATOR);
+		$resolved_target = realpath($owner_root . DIRECTORY_SEPARATOR . $target);
+
+		if (!$resolved_target
+			|| ($resolved_target !== $owner_root
+				&& !str_starts_with($resolved_target, $owner_root . DIRECTORY_SEPARATOR))) {
+			http_response_code(403);
+			echo 'Shared path is outside the owner storage';
+			return true;
+		}
 
 		if (!$this->dav->getStorage()->exists($target)) {
 			http_response_code(404);
@@ -166,6 +182,12 @@ class Server
 		try {
 			$props = $this->dav->getStorage()->propfind($target, ['DAV::resourcetype'], 0) ?: [];
 			$is_collection = ($props['DAV::resourcetype'] ?? null) === 'collection';
+
+			if (!$is_collection && !empty($share->hide_download)) {
+				http_response_code(403);
+				echo 'Downloads are disabled for this share';
+				return true;
+			}
 
 			if ($is_collection) {
 				if ($method === 'HEAD') {
@@ -206,7 +228,7 @@ class Server
 		return true;
 	}
 
-	protected function checkPublicSharePassword(\stdClass $share): bool
+	protected function checkPublicSharePassword(\stdClass $share, Shares $shares): bool
 	{
 		if (empty($share->password_hash)) {
 			return true;
@@ -219,9 +241,24 @@ class Server
 			return true;
 		}
 
+		$password_submitted = array_key_exists('password', $_POST);
 		$password = $_POST['password'] ?? null;
+		$ip = (string) ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+		$attempt = null;
+
+		if ($password_submitted) {
+			$attempt = $shares->reservePasswordAttempt($share, $ip);
+
+			if (!$attempt['allowed']) {
+				http_response_code(429);
+				header('Retry-After: ' . $attempt['retry_after']);
+				echo 'Too many password attempts. Please try again later.';
+				return false;
+			}
+		}
 
 		if (is_string($password) && password_verify($password, $share->password_hash)) {
+			$shares->clearPasswordFailures($share, $ip);
 			setcookie($cookie, $value, [
 				'expires' => time() + 3600,
 				'path' => parse_url(WWW_URL, PHP_URL_PATH) ?: '/',
@@ -232,12 +269,16 @@ class Server
 			return true;
 		}
 
-		http_response_code($password === null ? 200 : 403);
+		if ($attempt) {
+			header('Retry-After: ' . $attempt['retry_after']);
+		}
+
+		http_response_code($password_submitted ? 403 : 200);
 		header('Content-Type: text/html; charset=utf-8');
 		echo '<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Password required</title></head><body>';
 		echo '<h1>Password required</h1>';
 
-		if ($password !== null) {
+		if ($password_submitted) {
 			echo '<p>Invalid password.</p>';
 		}
 

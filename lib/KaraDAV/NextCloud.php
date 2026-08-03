@@ -118,6 +118,17 @@ class NextCloud extends WebDAV_NextCloud
 		return WebDAV::hmac([$uri, $user->login, $user->password]);
 	}
 
+	protected function nc_delete_app_password(): void
+	{
+		if (($_SERVER['REQUEST_METHOD'] ?? null) !== 'DELETE') {
+			throw new WebDAV_Exception('Invalid request method', 405);
+		}
+
+		$this->requireAuth();
+		$this->users->appSessionDelete($_SERVER['PHP_AUTH_PW'] ?? null);
+		http_response_code(204);
+	}
+
 	public function nc_capabilities(): array
 	{
 		$out = parent::nc_capabilities();
@@ -196,7 +207,8 @@ class NextCloud extends WebDAV_NextCloud
 				return $this->ocsError('KaraDAV currently supports public link shares only', 400);
 			}
 
-			$share = $shares->create($user, $path, Shares::TYPE_PUBLIC_LINK, (int)($_POST['permissions'] ?? Shares::PERMISSION_READ), [
+			$permissions = $this->normalizePublicSharePermissions($_POST['permissions'] ?? Shares::PERMISSION_READ);
+			$share = $shares->create($user, $path, Shares::TYPE_PUBLIC_LINK, $permissions, [
 				'password' => $_POST['password'] ?? '',
 				'expire_date' => $_POST['expireDate'] ?? '',
 				'note' => $_POST['note'] ?? '',
@@ -217,10 +229,14 @@ class NextCloud extends WebDAV_NextCloud
 			parse_str(file_get_contents('php://input'), $params);
 			$options = [];
 
-			foreach (['permissions', 'password', 'note', 'label'] as $key) {
+			foreach (['password', 'note', 'label'] as $key) {
 				if (array_key_exists($key, $params)) {
 					$options[$key] = $params[$key];
 				}
+			}
+
+			if (array_key_exists('permissions', $params)) {
+				$options['permissions'] = $this->normalizePublicSharePermissions($params['permissions']);
 			}
 
 			if (array_key_exists('expireDate', $params)) {
@@ -328,12 +344,40 @@ class NextCloud extends WebDAV_NextCloud
 		return in_array($value, [true, 1, '1', 'true', 'yes', 'on'], true);
 	}
 
+	protected function normalizePublicSharePermissions($value): int
+	{
+		$permissions = (int) $value;
+
+		if (!($permissions & Shares::PERMISSION_READ)) {
+			throw new WebDAV_Exception('Public upload-only shares are not supported', 400);
+		}
+
+		// KaraDAV public links are read-only. Preserve the SHARE compatibility bit,
+		// but never advertise unsupported write/create/delete permissions.
+		return $permissions & (Shares::PERMISSION_READ | Shares::PERMISSION_SHARE);
+	}
+
 	protected function cleanChunks(): void
 	{
 		$expire = time() - 36*3600;
+		$list = glob($this->temporary_chunks_path . '/*/*', GLOB_ONLYDIR);
 
-		foreach (glob($this->temporary_chunks_path . '/*/*') as $dir) {
-			$first_file = current(glob($dir . '/*'));
+		if (empty($list)) {
+			return;
+		}
+
+		foreach ($list as $dir) {
+			$dir_list = glob($dir . '/*');
+
+			if (!$dir_list) {
+				if (@filemtime($dir) < $expire) {
+					Storage::deleteDirectory($dir);
+				}
+
+				continue;
+			}
+
+			$first_file = current($dir_list);
 
 			if (filemtime($first_file) < $expire) {
 				Storage::deleteDirectory($dir);
@@ -345,34 +389,66 @@ class NextCloud extends WebDAV_NextCloud
 	{
 		$this->cleanChunks();
 
-		$path = $this->temporary_chunks_path . '/' . $login . '/' . $name;
-		@mkdir($path, 0777, true);
+		$user_chunks_path = $this->temporary_chunks_path . '/' . $login;
+		$path = $user_chunks_path . '/' . $name;
+		$lock_path = $this->temporary_chunks_path . '/_locks';
+		@mkdir($path, 0770, true);
+		@mkdir($lock_path, 0770, true);
+		$lock = fopen($lock_path . '/' . sha1($login) . '.lock', 'c');
+
+		if (!$lock || !flock($lock, LOCK_EX)) {
+			throw new WebDAV_Exception('Could not lock chunk quota', 500);
+		}
 
 		$file_path = $path . '/' . $part;
 		$out = fopen($file_path, 'wb');
-		$quota = $this->getUserQuota();
-		$used = $quota['used'] + Storage::getDirectorySize($path);
 
-		while (!feof($pointer)) {
-			$data = fread($pointer, 8192);
-			$used += strlen($used);
-
-			if ($used > $quota['free']) {
-				$this->deleteChunks($login, $name);
-				throw new WebDAV_Exception('Your quota does not allow for the upload of this file', 403);
-			}
-
-			fwrite($out, $data);
+		if (!$out) {
+			flock($lock, LOCK_UN);
+			fclose($lock);
+			throw new WebDAV_Exception('Could not store upload chunk', 500);
 		}
 
-		fclose($out);
-		fclose($pointer);
+		try {
+			$quota = $this->getUserQuota();
+			$used = $quota['used'] + Storage::getDirectorySize($user_chunks_path);
+
+			while (!feof($pointer)) {
+				$data = fread($pointer, 8192);
+
+				if ($data === false) {
+					throw new WebDAV_Exception('Could not read upload chunk', 500);
+				}
+
+				$used += strlen($data);
+
+				if ($used > $quota['total']) {
+					$this->deleteChunks($login, $name);
+					throw new WebDAV_Exception('Your quota does not allow for the upload of this file', 403);
+				}
+
+				if ($data !== '' && fwrite($out, $data) !== strlen($data)) {
+					throw new WebDAV_Exception('Could not store upload chunk', 500);
+				}
+			}
+		}
+		finally {
+			fclose($out);
+			fclose($pointer);
+			flock($lock, LOCK_UN);
+			fclose($lock);
+		}
 	}
 
 	public function listChunks(string $login, string $name): array
 	{
-		$path = $this->temporary_chunks_path . '/' . $name;
+		$path = $this->temporary_chunks_path . '/' . $login . '/' . $name;
 		$list = glob($path . '/*');
+
+		if (!$list) {
+			return [];
+		}
+
 		$list = array_map(fn($a) => str_replace($path . '/', '', $a), $list);
 		return $list;
 	}
@@ -385,6 +461,7 @@ class NextCloud extends WebDAV_NextCloud
 
 	public function assembleChunks(string $login, string $name, string $target, ?int $mtime): array
 	{
+		$uri = $target;
 		$target = $this->users->current()->path . $target;
 		$parent = dirname($target);
 
@@ -399,26 +476,85 @@ class NextCloud extends WebDAV_NextCloud
 			throw new WebDAV_Exception('Target exists and is a directory', 409);
 		}
 
-		$out = fopen($target, 'wb');
+		$list = glob($path . '/*') ?: [];
 
-		foreach (glob($path . '/*') as $file) {
-			$in = fopen($file, 'rb');
+		if (!$list) {
+			throw new WebDAV_Exception('No chunks were uploaded', 400);
+		}
 
-			while (!feof($in)) {
-				fwrite($out, fread($in, 8192));
+		// Make sure chunks are ordered "naturally": 1, 2, 3, 10, 11, and no 1, 10, 11, 2, 3…
+		natcasesort($list);
+		$tmp_dir = sprintf(STORAGE_PATH, '_tmp');
+		@mkdir($tmp_dir, 0770, true);
+		$tmp_target = tempnam($tmp_dir, 'chunks-');
+
+		if (!$tmp_target) {
+			throw new WebDAV_Exception('Could not create temporary upload file', 500);
+		}
+
+		$out = fopen($tmp_target, 'wb');
+
+		if (!$out) {
+			@unlink($tmp_target);
+			throw new WebDAV_Exception('Could not open temporary upload file', 500);
+		}
+
+		try {
+			foreach ($list as $file) {
+				$in = fopen($file, 'rb');
+
+				if (!$in) {
+					throw new WebDAV_Exception('Could not read an upload chunk', 500);
+				}
+
+				try {
+					while (!feof($in)) {
+						$data = fread($in, 8192);
+
+						if ($data === false || ($data !== '' && fwrite($out, $data) !== strlen($data))) {
+							throw new WebDAV_Exception('Could not assemble upload chunks', 500);
+						}
+					}
+				}
+				finally {
+					fclose($in);
+				}
 			}
 
-			fclose($in);
+			fclose($out);
+			$out = null;
+
+			if ($mtime) {
+				touch($tmp_target, $mtime);
+			}
+
+			if (!rename($tmp_target, $target)) {
+				throw new WebDAV_Exception('Could not install assembled upload', 500);
+			}
+
+			if ($exists) {
+				(new Shares)->deleteForPath($this->users->current()->id, $uri);
+			}
+
+			$tmp_target = null;
+			$this->deleteChunks($login, $name);
+		}
+		finally {
+			if (is_resource($out)) {
+				fclose($out);
+			}
+
+			if ($tmp_target && file_exists($tmp_target)) {
+				@unlink($tmp_target);
+			}
 		}
 
-		fclose($out);
-		$this->deleteChunks($login, $name);
+		$this->storage->createFileCache($uri);
 
-		if ($mtime) {
-			touch($target, $mtime);
-		}
-
-		return ['created' => !$exists, 'etag' => md5(filemtime($target) . filesize($target))];
+		return [
+			'created' => !$exists,
+			'etag'    => $this->storage->get_file_property($uri, 'DAV::getetag', 0),
+		];
 	}
 
 	protected function nc_avatar(?string $uri = null): void

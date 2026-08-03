@@ -11,8 +11,9 @@ services:
     container_name: karadav
     restart: unless-stopped
     working_dir: /app
+    # The built-in server is plain HTTP; only expose it on loopback for testing.
     ports:
-      - "8443:8080"
+      - "127.0.0.1:8443:8080"
     volumes:
       - .:/app
     command: php -S 0.0.0.0:8080 -t /app/www /app/www/_router.php
