@@ -2,11 +2,11 @@
 
 <img align="right" style="float: right" src="www/logo.svg" />
 
-[**Donate to this project**](https://kd2.org/donate)
-
 This is a fork of [KaraDAV](https://github.com/kd2org/karadav/), a lightweight PHP WebDAV server that supports syncing via the NextCloud and OwnCloud clients. 
 
-This fork was created to support the iOS and macOS clients (which the original didn't support, though some of my changes have been merged upstream).  Since then I've added a few more features which I wanted.
+This fork was created because I wanted something simple, light and fast to sync files between my Mac, Linux & iOS computers. KaraDAV was the best option I could find, but the author wasn't interested in adding support for iOS and macOS. 
+
+The initial fork added support for the NextCloud and OwnCloud clients on macOS and iOS (some of my changes have been merged upstream). Since then I've added a few more features:
 
  - Added macOS Finder virtual-file and sharing integration.
  - Added internal user shares and password-protected public links.
